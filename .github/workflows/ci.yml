@@ -183,7 +183,7 @@ jobs:
                   compression-level: 0
 
             - name: Remove local artifacts
-            - run: |
+              run: |
                   rm -rf static-${{ matrix.target }} || echo
                   rm -f target/debian/${{ matrix.target }}.deb || echo
                   rm -rf deb-${{ matrix.target }} || echo
