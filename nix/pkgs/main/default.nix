@@ -11,7 +11,7 @@
 # Options (keep sorted)
 , default_features ? true
 , features ? []
-, profile ? "release"
+, profile ? "release-high-perf"
 }:
 
 let
