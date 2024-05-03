@@ -1,12 +1,7 @@
 name: Trivy code and vulnerability scanning
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: '00 12 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
