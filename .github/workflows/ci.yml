@@ -182,6 +182,14 @@ jobs:
                   if-no-files-found: error
                   compression-level: 0
 
+            - name: Remove local artifacts
+            - run: |
+                  rm -rf static-${{ matrix.target }} || echo
+                  rm -f target/debian/${{ matrix.target }}.deb || echo
+                  rm -rf deb-${{ matrix.target }} || echo
+                  rm -rf oci-image-${{ matrix.target }} || echo
+                  rm -f oci-image-${{ matrix.target }}.tar.gz || echo
+
     docker:
         name: Docker publish
         runs-on: self-hosted
@@ -207,13 +215,11 @@ jobs:
                   mv oci-image-x86_64-*-jemalloc/*.tar.gz oci-image-amd64.tar.gz
 
             - name: Load and push amd64 image
-              if: ${{ (vars.DOCKER_USERNAME != '') && (env.DOCKERHUB_TOKEN != '') }}
               run: |
                   docker load -i oci-image-amd64.tar.gz
                   docker tag $(docker images -q conduit:main) ${{ env.GHCR_AMD64 }}
                   docker push ${{ env.GHCR_AMD64 }}
 
             - name: Add Image Links to Job Summary
-              if: ${{ (vars.DOCKER_USERNAME != '') && (env.DOCKERHUB_TOKEN != '') }}
               run: |
                   echo "- \`docker pull ${{ env.GHCR_TAG }}\`" >> $GITHUB_STEP_SUMMARY
