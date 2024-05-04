@@ -130,7 +130,7 @@ pub(crate) async fn create_content_route(
 			mxc.clone(),
 			body.filename
 				.as_ref()
-				.map(|filename| "inline; filename=".to_owned() + filename)
+				.map(|filename| format!("inline; filename={filename}"))
 				.as_deref(),
 			body.content_type.as_deref(),
 			&body.file,
