@@ -84,7 +84,13 @@ craneLib.buildPackage ( commonAttrs // {
       "--features " + (builtins.concatStringsSep "," features);
 
   # This is redundant with CI
+  cargoTestCommand = "";
+
+  # This is redundant with CI
   doCheck = false;
+
+  # https://crane.dev/faq/rebuilds-bindgen.html
+  NIX_OUTPATH_USED_AS_RANDOM_SEED = "aaaaaaaaaa";
 
   env = buildPackageEnv;
 

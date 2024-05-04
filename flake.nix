@@ -8,7 +8,8 @@
     flake-utils.url = "github:numtide/flake-utils?ref=main";
     nix-filter.url = "github:numtide/nix-filter?ref=main";
     nixpkgs.url = "github:NixOS/nixpkgs?ref=nixos-unstable";
-    rocksdb = { url = "github:facebook/rocksdb?ref=v9.1.1"; flake = false; };
+    # https://github.com/girlbossceo/rocksdb/commit/db6df0b185774778457dabfcbd822cb81760cade
+    rocksdb = { url = "github:girlbossceo/rocksdb?ref=v9.1.1"; flake = false; };
   };
 
   outputs = inputs:
@@ -21,7 +22,7 @@
         file = ./rust-toolchain.toml;
 
         # See also `rust-toolchain.toml`
-        sha256 = "sha256-e4mlaJehWBymYxJGgnbuCObVlqMlQSilZ8FljG9zPHY=";
+        sha256 = "sha256-+syqAd2kX8KVa8/U2gz3blIQTTsYYt3U63xBWaGOSc8";
       };
 
       scope = pkgs: pkgs.lib.makeScope pkgs.newScope (self: {
@@ -179,6 +180,10 @@
           # Useful for editing the book locally
           mdbook
         ])
+        ++ (if !pkgsHost.stdenv.isDarwin then [
+            # Needed for building with io_uring
+            pkgsHost.liburing
+        ] else [])
         ++
         scopeHost.main.nativeBuildInputs;
       };
