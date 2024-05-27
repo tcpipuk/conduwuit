@@ -17,7 +17,7 @@
 , all_features ? false
 , disable_features ? []
 , features ? []
-, profile ? "release"
+, profile ? "release-high-perf"
 }:
 
 let
