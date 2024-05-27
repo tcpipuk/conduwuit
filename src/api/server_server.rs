@@ -8,6 +8,7 @@ use std::{
 };
 
 use axum::{response::IntoResponse, Json};
+use conduit::debug_warn;
 use get_profile_information::v1::ProfileField;
 use rand::seq::SliceRandom;
 use ruma::{
@@ -206,10 +207,28 @@ pub(crate) async fn get_public_rooms_route(
 pub(crate) async fn send_transaction_message_route(
 	body: Ruma<send_transaction_message::v1::Request>,
 ) -> Result<send_transaction_message::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
+
+	if *origin != body.body.origin {
+		return Err(Error::BadRequest(
+			ErrorKind::forbidden(),
+			"Not allowed to send transactions on behalf of other servers",
+		));
+	}
+
+	if body.pdus.len() > 50_usize {
+		return Err(Error::BadRequest(
+			ErrorKind::forbidden(),
+			"Not allowed to send more than 50 PDUs in one transaction",
+		));
+	}
+
+	if body.edus.len() > 100_usize {
+		return Err(Error::BadRequest(
+			ErrorKind::forbidden(),
+			"Not allowed to send more than 100 EDUs in one transaction",
+		));
+	}
 
 	// This is all the auth_events that have been recursively fetched so they don't
 	// have to be deserialized over and over again.
@@ -253,7 +272,7 @@ pub(crate) async fn send_transaction_message_route(
 			.fetch_required_signing_keys(parsed_pdus.iter().map(|(_event_id, event, _room_id)| event), &pub_key_map)
 			.await
 			.unwrap_or_else(|e| {
-				warn!("Could not fetch all signatures for PDUs from {}: {:?}", sender_servername, e);
+				warn!("Could not fetch all signatures for PDUs from {origin}: {:?}", e);
 			});
 
 		debug!(
@@ -280,7 +299,7 @@ pub(crate) async fn send_transaction_message_route(
 			services()
 				.rooms
 				.event_handler
-				.handle_incoming_pdu(sender_servername, &room_id, &event_id, value, true, &pub_key_map)
+				.handle_incoming_pdu(origin, &room_id, &event_id, value, true, &pub_key_map)
 				.await
 				.map(|_| ()),
 		);
@@ -313,6 +332,11 @@ pub(crate) async fn send_transaction_message_route(
 				}
 
 				for update in presence.push {
+					if update.user_id.server_name() != origin {
+						debug_warn!(%update.user_id, %origin, "received presence EDU for user not belonging to origin");
+						continue;
+					}
+
 					services().presence.set_presence(
 						&update.user_id,
 						&update.presence,
@@ -328,47 +352,82 @@ pub(crate) async fn send_transaction_message_route(
 				}
 
 				for (room_id, room_updates) in receipt.receipts {
+					if services()
+						.rooms
+						.event_handler
+						.acl_check(origin, &room_id)
+						.is_err()
+					{
+						debug_warn!(%origin, %room_id, "received read receipt EDU from ACL'd server");
+						continue;
+					}
+
 					for (user_id, user_updates) in room_updates.read {
-						if let Some((event_id, _)) = user_updates
-							.event_ids
-							.iter()
-							.filter_map(|id| {
+						if user_id.server_name() != origin {
+							debug_warn!(%user_id, %origin, "received read receipt EDU for user not belonging to origin");
+							continue;
+						}
+
+						if services().rooms.state_cache.is_joined(&user_id, &room_id)? {
+							if let Some((event_id, _)) = user_updates
+								.event_ids
+								.iter()
+								.filter_map(|id| {
+									services()
+										.rooms
+										.timeline
+										.get_pdu_count(id)
+										.ok()
+										.flatten()
+										.map(|r| (id, r))
+								})
+								.max_by_key(|(_, count)| *count)
+							{
+								let mut user_receipts = BTreeMap::new();
+								user_receipts.insert(user_id.clone(), user_updates.data);
+
+								let mut receipts = BTreeMap::new();
+								receipts.insert(ReceiptType::Read, user_receipts);
+
+								let mut receipt_content = BTreeMap::new();
+								receipt_content.insert(event_id.to_owned(), receipts);
+
+								let event = ReceiptEvent {
+									content: ReceiptEventContent(receipt_content),
+									room_id: room_id.clone(),
+								};
 								services()
 									.rooms
-									.timeline
-									.get_pdu_count(id)
-									.ok()
-									.flatten()
-									.map(|r| (id, r))
-							})
-							.max_by_key(|(_, count)| *count)
-						{
-							let mut user_receipts = BTreeMap::new();
-							user_receipts.insert(user_id.clone(), user_updates.data);
-
-							let mut receipts = BTreeMap::new();
-							receipts.insert(ReceiptType::Read, user_receipts);
-
-							let mut receipt_content = BTreeMap::new();
-							receipt_content.insert(event_id.to_owned(), receipts);
-
-							let event = ReceiptEvent {
-								content: ReceiptEventContent(receipt_content),
-								room_id: room_id.clone(),
-							};
-							services()
-								.rooms
-								.read_receipt
-								.readreceipt_update(&user_id, &room_id, event)?;
+									.read_receipt
+									.readreceipt_update(&user_id, &room_id, event)?;
+							} else {
+								// TODO fetch missing events
+								debug_error!("No known event ids in read receipt: {:?}", user_updates);
+							}
 						} else {
-							// TODO fetch missing events
-							debug_error!("No known event ids in read receipt: {:?}", user_updates);
+							debug_warn!(%user_id, %room_id, "received read receipt EDU for user not in room");
+							continue;
 						}
 					}
 				}
 			},
 			Edu::Typing(typing) => {
 				if !services().globals.config.allow_incoming_typing {
+					continue;
+				}
+
+				if typing.user_id.server_name() != origin {
+					debug_warn!(%typing.user_id, %origin, "received typing EDU for user not belonging to origin");
+					continue;
+				}
+
+				if services()
+					.rooms
+					.event_handler
+					.acl_check(typing.user_id.server_name(), &typing.room_id)
+					.is_err()
+				{
+					debug_warn!(%typing.user_id, %typing.room_id, "received typing EDU for ACL'd user's server");
 					continue;
 				}
 
@@ -397,12 +456,20 @@ pub(crate) async fn send_transaction_message_route(
 							.typing_remove(&typing.user_id, &typing.room_id)
 							.await?;
 					}
+				} else {
+					debug_warn!(%typing.user_id, %typing.room_id, "received typing EDU for user not in room");
+					continue;
 				}
 			},
 			Edu::DeviceListUpdate(DeviceListUpdateContent {
 				user_id,
 				..
 			}) => {
+				if user_id.server_name() != origin {
+					debug_warn!(%user_id, %origin, "received device list update EDU for user not belonging to origin");
+					continue;
+				}
+
 				services().users.mark_device_key_update(&user_id)?;
 			},
 			Edu::DirectToDevice(DirectDeviceContent {
@@ -411,6 +478,11 @@ pub(crate) async fn send_transaction_message_route(
 				message_id,
 				messages,
 			}) => {
+				if sender.server_name() != origin {
+					debug_warn!(%sender, %origin, "received direct to device EDU for user not belonging to origin");
+					continue;
+				}
+
 				// Check if this is a new transaction id
 				if services()
 					.transaction_ids
@@ -463,16 +535,20 @@ pub(crate) async fn send_transaction_message_route(
 				master_key,
 				self_signing_key,
 			}) => {
-				if user_id.server_name() != sender_servername {
+				if user_id.server_name() != origin {
+					debug_warn!(%user_id, %origin, "received signing key update EDU from server that does not belong to user's server");
 					continue;
 				}
+
 				if let Some(master_key) = master_key {
 					services()
 						.users
 						.add_cross_signing_keys(&user_id, &master_key, &self_signing_key, &None, true)?;
 				}
 			},
-			Edu::_Custom(_) => {},
+			Edu::_Custom(custom) => {
+				debug_warn!(?custom, "received custom/unknown EDU");
+			},
 		}
 	}
 
@@ -500,10 +576,7 @@ pub(crate) async fn send_transaction_message_route(
 /// - Only works if a user of this server is currently invited or joined the
 ///   room
 pub(crate) async fn get_event_route(body: Ruma<get_event::v1::Request>) -> Result<get_event::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	let event = services()
 		.rooms
@@ -514,23 +587,23 @@ pub(crate) async fn get_event_route(body: Ruma<get_event::v1::Request>) -> Resul
 	let room_id_str = event
 		.get("room_id")
 		.and_then(|val| val.as_str())
-		.ok_or_else(|| Error::bad_database("Invalid event in database"))?;
+		.ok_or_else(|| Error::bad_database("Invalid event in database."))?;
 
-	let room_id = <&RoomId>::try_from(room_id_str)
-		.map_err(|_| Error::bad_database("Invalid room id field in event in database"))?;
+	let room_id =
+		<&RoomId>::try_from(room_id_str).map_err(|_| Error::bad_database("Invalid room_id in event in database."))?;
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, room_id)?
+		.server_in_room(origin, room_id)?
 	{
-		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room"));
+		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room."));
 	}
 
 	if !services()
 		.rooms
 		.state_accessor
-		.server_can_see_event(sender_servername, room_id, &body.event_id)?
+		.server_can_see_event(origin, room_id, &body.event_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not allowed to see event."));
 	}
@@ -547,15 +620,12 @@ pub(crate) async fn get_event_route(body: Ruma<get_event::v1::Request>) -> Resul
 /// Retrieves events from before the sender joined the room, if the room's
 /// history visibility allows.
 pub(crate) async fn get_backfill_route(body: Ruma<get_backfill::v1::Request>) -> Result<get_backfill::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, &body.room_id)?
+		.server_in_room(origin, &body.room_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room."));
 	}
@@ -563,15 +633,15 @@ pub(crate) async fn get_backfill_route(body: Ruma<get_backfill::v1::Request>) ->
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let until = body
 		.v
 		.iter()
-		.map(|eventid| services().rooms.timeline.get_pdu_count(eventid))
+		.map(|event_id| services().rooms.timeline.get_pdu_count(event_id))
 		.filter_map(|r| r.ok().flatten())
 		.max()
-		.ok_or(Error::BadRequest(ErrorKind::InvalidParam, "No known eventid in v"))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event not found."))?;
 
 	let limit = body.limit.min(uint!(100));
 
@@ -588,7 +658,7 @@ pub(crate) async fn get_backfill_route(body: Ruma<get_backfill::v1::Request>) ->
 				services()
 					.rooms
 					.state_accessor
-					.server_can_see_event(sender_servername, &e.room_id, &e.event_id,),
+					.server_can_see_event(origin, &e.room_id, &e.event_id,),
 				Ok(true),
 			)
 		})
@@ -610,15 +680,12 @@ pub(crate) async fn get_backfill_route(body: Ruma<get_backfill::v1::Request>) ->
 pub(crate) async fn get_missing_events_route(
 	body: Ruma<get_missing_events::v1::Request>,
 ) -> Result<get_missing_events::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, &body.room_id)?
+		.server_in_room(origin, &body.room_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room"));
 	}
@@ -626,7 +693,7 @@ pub(crate) async fn get_missing_events_route(
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let mut queued_events = body.latest_events.clone();
 	let mut events = Vec::new();
@@ -637,13 +704,13 @@ pub(crate) async fn get_missing_events_route(
 			let room_id_str = pdu
 				.get("room_id")
 				.and_then(|val| val.as_str())
-				.ok_or_else(|| Error::bad_database("Invalid event in database"))?;
+				.ok_or_else(|| Error::bad_database("Invalid event in database."))?;
 
 			let event_room_id = <&RoomId>::try_from(room_id_str)
-				.map_err(|_| Error::bad_database("Invalid room id field in event in database"))?;
+				.map_err(|_| Error::bad_database("Invalid room_id in event in database."))?;
 
 			if event_room_id != body.room_id {
-				return Err(Error::BadRequest(ErrorKind::InvalidParam, "Event from wrong room"));
+				return Err(Error::BadRequest(ErrorKind::InvalidParam, "Event from wrong room."));
 			}
 
 			if body.earliest_events.contains(&queued_events[i]) {
@@ -651,11 +718,11 @@ pub(crate) async fn get_missing_events_route(
 				continue;
 			}
 
-			if !services().rooms.state_accessor.server_can_see_event(
-				sender_servername,
-				&body.room_id,
-				&queued_events[i],
-			)? {
+			if !services()
+				.rooms
+				.state_accessor
+				.server_can_see_event(origin, &body.room_id, &queued_events[i])?
+			{
 				i = i.saturating_add(1);
 				continue;
 			}
@@ -665,11 +732,11 @@ pub(crate) async fn get_missing_events_route(
 					serde_json::to_value(
 						pdu.get("prev_events")
 							.cloned()
-							.ok_or_else(|| Error::bad_database("Event in db has no prev_events field."))?,
+							.ok_or_else(|| Error::bad_database("Event in db has no prev_events property."))?,
 					)
 					.expect("canonical json is valid json value"),
 				)
-				.map_err(|_| Error::bad_database("Invalid prev_events content in pdu in db."))?,
+				.map_err(|_| Error::bad_database("Invalid prev_events in event in database."))?,
 			);
 			events.push(PduEvent::convert_to_outgoing_federation_event(pdu));
 		}
@@ -689,15 +756,12 @@ pub(crate) async fn get_missing_events_route(
 pub(crate) async fn get_event_authorization_route(
 	body: Ruma<get_event_authorization::v1::Request>,
 ) -> Result<get_event_authorization::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, &body.room_id)?
+		.server_in_room(origin, &body.room_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room."));
 	}
@@ -705,7 +769,7 @@ pub(crate) async fn get_event_authorization_route(
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let event = services()
 		.rooms
@@ -716,10 +780,10 @@ pub(crate) async fn get_event_authorization_route(
 	let room_id_str = event
 		.get("room_id")
 		.and_then(|val| val.as_str())
-		.ok_or_else(|| Error::bad_database("Invalid event in database"))?;
+		.ok_or_else(|| Error::bad_database("Invalid event in database."))?;
 
-	let room_id = <&RoomId>::try_from(room_id_str)
-		.map_err(|_| Error::bad_database("Invalid room id field in event in database"))?;
+	let room_id =
+		<&RoomId>::try_from(room_id_str).map_err(|_| Error::bad_database("Invalid room_id in event in database."))?;
 
 	let auth_chain_ids = services()
 		.rooms
@@ -741,15 +805,12 @@ pub(crate) async fn get_event_authorization_route(
 pub(crate) async fn get_room_state_route(
 	body: Ruma<get_room_state::v1::Request>,
 ) -> Result<get_room_state::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, &body.room_id)?
+		.server_in_room(origin, &body.room_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room."));
 	}
@@ -757,13 +818,13 @@ pub(crate) async fn get_room_state_route(
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let shortstatehash = services()
 		.rooms
 		.state_accessor
 		.pdu_shortstatehash(&body.event_id)?
-		.ok_or(Error::BadRequest(ErrorKind::NotFound, "Pdu state not found."))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::NotFound, "Pdu state not found."))?;
 
 	let pdus = services()
 		.rooms
@@ -810,15 +871,12 @@ pub(crate) async fn get_room_state_route(
 pub(crate) async fn get_room_state_ids_route(
 	body: Ruma<get_room_state_ids::v1::Request>,
 ) -> Result<get_room_state_ids::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if !services()
 		.rooms
 		.state_cache
-		.server_in_room(sender_servername, &body.room_id)?
+		.server_in_room(origin, &body.room_id)?
 	{
 		return Err(Error::BadRequest(ErrorKind::forbidden(), "Server is not in room."));
 	}
@@ -826,13 +884,13 @@ pub(crate) async fn get_room_state_ids_route(
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let shortstatehash = services()
 		.rooms
 		.state_accessor
 		.pdu_shortstatehash(&body.event_id)?
-		.ok_or(Error::BadRequest(ErrorKind::NotFound, "Pdu state not found."))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::NotFound, "Pdu state not found."))?;
 
 	let pdu_ids = services()
 		.rooms
@@ -865,25 +923,29 @@ pub(crate) async fn create_join_event_template_route(
 		return Err(Error::BadRequest(ErrorKind::NotFound, "Room is unknown to this server."));
 	}
 
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
+	if body.user_id.server_name() != origin {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to join on behalf of another server/user",
+		));
+	}
 
+	// ACL check origin server
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	if services()
 		.globals
 		.config
 		.forbidden_remote_server_names
-		.contains(sender_servername)
+		.contains(origin)
 	{
 		warn!(
-			"Server {sender_servername} for remote user {} tried joining room ID {} which has a server name that is \
-			 globally forbidden. Rejecting.",
+			"Server {origin} for remote user {} tried joining room ID {} which has a server name that is globally \
+			 forbidden. Rejecting.",
 			&body.user_id, &body.room_id,
 		);
 		return Err(Error::BadRequest(
@@ -1072,17 +1134,16 @@ pub(crate) async fn create_join_event_template_route(
 	})
 }
 
+/// helper method for /send_join v1 and v2
 async fn create_join_event(
-	sender_servername: &ServerName, room_id: &RoomId, pdu: &RawJsonValue,
+	origin: &ServerName, room_id: &RoomId, pdu: &RawJsonValue,
 ) -> Result<create_join_event::v1::RoomState> {
 	if !services().rooms.metadata.exists(room_id)? {
 		return Err(Error::BadRequest(ErrorKind::NotFound, "Room is unknown to this server."));
 	}
 
-	services()
-		.rooms
-		.event_handler
-		.acl_check(sender_servername, room_id)?;
+	// ACL check origin server
+	services().rooms.event_handler.acl_check(origin, room_id)?;
 
 	// We need to return the state prior to joining, let's keep a reference to that
 	// here
@@ -1090,7 +1151,7 @@ async fn create_join_event(
 		.rooms
 		.state
 		.get_room_shortstatehash(room_id)?
-		.ok_or(Error::BadRequest(ErrorKind::NotFound, "Pdu state not found."))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::NotFound, "Event state not found."))?;
 
 	let pub_key_map = RwLock::new(BTreeMap::new());
 	// let mut auth_cache = EventMap::new();
@@ -1107,6 +1168,83 @@ async fn create_join_event(
 		));
 	};
 
+	let event_type: StateEventType = serde_json::from_value(
+		value
+			.get("type")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing type property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Event has invalid event type."))?;
+
+	if event_type != StateEventType::RoomMember {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to send non-membership state event to join endpoint.",
+		));
+	}
+
+	let content = value
+		.get("content")
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing content property."))?
+		.as_object()
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event content is empty or invalid."))?;
+
+	let membership: MembershipState = serde_json::from_value(
+		content
+			.get("membership")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event content missing membership property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "Event has an invalid membership state."))?;
+
+	if membership != MembershipState::Join {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to send a non-join membership event to join endpoint.",
+		));
+	}
+
+	// ACL check sender server name
+	let sender: OwnedUserId = serde_json::from_value(
+		value
+			.get("sender")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing sender property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "sender is not a valid user ID."))?;
+
+	services()
+		.rooms
+		.event_handler
+		.acl_check(sender.server_name(), room_id)?;
+
+	// check if origin server is trying to send for another server
+	if sender.server_name() != origin {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to join on behalf of another server.",
+		));
+	}
+
+	let state_key: OwnedUserId = serde_json::from_value(
+		value
+			.get("state_key")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing state_key property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "state_key is invalid or not a user ID."))?;
+
+	if state_key != sender {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"State key does not match sender user",
+		));
+	}
+
 	ruma::signatures::hash_and_sign_event(
 		services().globals.server_name().as_str(),
 		services().globals.keypair(),
@@ -1119,11 +1257,11 @@ async fn create_join_event(
 		serde_json::to_value(
 			value
 				.get("origin")
-				.ok_or(Error::BadRequest(ErrorKind::InvalidParam, "Event needs an origin field."))?,
+				.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing origin property."))?,
 		)
 		.expect("CanonicalJson is valid json value"),
 	)
-	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Origin field is invalid."))?;
+	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "origin is not a server name."))?;
 
 	services()
 		.rooms
@@ -1146,10 +1284,7 @@ async fn create_join_event(
 		.event_handler
 		.handle_incoming_pdu(&origin, room_id, &event_id, value.clone(), true, &pub_key_map)
 		.await?
-		.ok_or(Error::BadRequest(
-			ErrorKind::InvalidParam,
-			"Could not accept incoming PDU as timeline event.",
-		))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Could not accept as timeline event."))?;
 	drop(mutex_lock);
 
 	let state_ids = services()
@@ -1189,20 +1324,16 @@ async fn create_join_event(
 pub(crate) async fn create_join_event_v1_route(
 	body: Ruma<create_join_event::v1::Request>,
 ) -> Result<create_join_event::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if services()
 		.globals
 		.config
 		.forbidden_remote_server_names
-		.contains(sender_servername)
+		.contains(origin)
 	{
 		warn!(
-			"Server {sender_servername} tried joining room ID {} who has a server name that is globally forbidden. \
-			 Rejecting.",
+			"Server {origin} tried joining room ID {} who has a server name that is globally forbidden. Rejecting.",
 			&body.room_id,
 		);
 		return Err(Error::BadRequest(
@@ -1219,8 +1350,8 @@ pub(crate) async fn create_join_event_v1_route(
 			.contains(&server.to_owned())
 		{
 			warn!(
-				"Server {sender_servername} tried joining room ID {} which has a server name that is globally \
-				 forbidden. Rejecting.",
+				"Server {origin} tried joining room ID {} which has a server name that is globally forbidden. \
+				 Rejecting.",
 				&body.room_id,
 			);
 			return Err(Error::BadRequest(
@@ -1230,7 +1361,7 @@ pub(crate) async fn create_join_event_v1_route(
 		}
 	}
 
-	let room_state = create_join_event(sender_servername, &body.room_id, &body.pdu).await?;
+	let room_state = create_join_event(origin, &body.room_id, &body.pdu).await?;
 
 	Ok(create_join_event::v1::Response {
 		room_state,
@@ -1243,16 +1374,13 @@ pub(crate) async fn create_join_event_v1_route(
 pub(crate) async fn create_join_event_v2_route(
 	body: Ruma<create_join_event::v2::Request>,
 ) -> Result<create_join_event::v2::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if services()
 		.globals
 		.config
 		.forbidden_remote_server_names
-		.contains(sender_servername)
+		.contains(origin)
 	{
 		return Err(Error::BadRequest(
 			ErrorKind::forbidden(),
@@ -1278,7 +1406,7 @@ pub(crate) async fn create_join_event_v2_route(
 		auth_chain,
 		state,
 		event,
-	} = create_join_event(sender_servername, &body.room_id, &body.pdu).await?;
+	} = create_join_event(origin, &body.room_id, &body.pdu).await?;
 	let room_state = create_join_event::v2::RoomState {
 		members_omitted: false,
 		auth_chain,
@@ -1298,15 +1426,23 @@ pub(crate) async fn create_join_event_v2_route(
 pub(crate) async fn create_leave_event_template_route(
 	body: Ruma<prepare_leave_event::v1::Request>,
 ) -> Result<prepare_leave_event::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	if !services().rooms.metadata.exists(&body.room_id)? {
+		return Err(Error::BadRequest(ErrorKind::NotFound, "Room is unknown to this server."));
+	}
 
+	let origin = body.origin.as_ref().expect("server is authenticated");
+	if body.user_id.server_name() != origin {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to leave on behalf of another server/user",
+		));
+	}
+
+	// ACL check origin
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	let room_version_id = services().rooms.state.get_room_version(&body.room_id)?;
 
@@ -1376,15 +1512,13 @@ pub(crate) async fn create_leave_event_template_route(
 	})
 }
 
-async fn create_leave_event(sender_servername: &ServerName, room_id: &RoomId, pdu: &RawJsonValue) -> Result<()> {
+async fn create_leave_event(origin: &ServerName, room_id: &RoomId, pdu: &RawJsonValue) -> Result<()> {
 	if !services().rooms.metadata.exists(room_id)? {
 		return Err(Error::BadRequest(ErrorKind::NotFound, "Room is unknown to this server."));
 	}
 
-	services()
-		.rooms
-		.event_handler
-		.acl_check(sender_servername, room_id)?;
+	// ACL check origin
+	services().rooms.event_handler.acl_check(origin, room_id)?;
 
 	let pub_key_map = RwLock::new(BTreeMap::new());
 
@@ -1399,15 +1533,91 @@ async fn create_leave_event(sender_servername: &ServerName, room_id: &RoomId, pd
 		));
 	};
 
+	let content = value
+		.get("content")
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing content property."))?
+		.as_object()
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event content not an object."))?;
+
+	let membership: MembershipState = serde_json::from_value(
+		content
+			.get("membership")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event membership is missing."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "Event membership state is not valid."))?;
+
+	if membership != MembershipState::Leave {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to send a non-leave membership event to leave endpoint.",
+		));
+	}
+
+	let event_type: StateEventType = serde_json::from_value(
+		value
+			.get("type")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing type property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "Event does not have a valid state event type."))?;
+
+	if event_type != StateEventType::RoomMember {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to send non-membership state event to leave endpoint.",
+		));
+	}
+
+	// ACL check sender server name
+	let sender: OwnedUserId = serde_json::from_value(
+		value
+			.get("sender")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing sender property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "User ID in sender is invalid."))?;
+
+	services()
+		.rooms
+		.event_handler
+		.acl_check(sender.server_name(), room_id)?;
+
+	if sender.server_name() != origin {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"Not allowed to leave on behalf of another server.",
+		));
+	}
+
+	let state_key: OwnedUserId = serde_json::from_value(
+		value
+			.get("state_key")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing state_key property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "state_key is invalid or not a user ID"))?;
+
+	if state_key != sender {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"state_key does not match sender user.",
+		));
+	}
+
 	let origin: OwnedServerName = serde_json::from_value(
 		serde_json::to_value(
 			value
 				.get("origin")
-				.ok_or(Error::BadRequest(ErrorKind::InvalidParam, "Event needs an origin field."))?,
+				.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event missing origin property."))?,
 		)
 		.expect("CanonicalJson is valid json value"),
 	)
-	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Origin field is invalid."))?;
+	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "origin is not a server name."))?;
 
 	services()
 		.rooms
@@ -1430,10 +1640,7 @@ async fn create_leave_event(sender_servername: &ServerName, room_id: &RoomId, pd
 		.event_handler
 		.handle_incoming_pdu(&origin, room_id, &event_id, value, true, &pub_key_map)
 		.await?
-		.ok_or(Error::BadRequest(
-			ErrorKind::InvalidParam,
-			"Could not accept incoming PDU as timeline event.",
-		))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Could not accept as timeline event."))?;
 
 	drop(mutex_lock);
 
@@ -1455,12 +1662,9 @@ async fn create_leave_event(sender_servername: &ServerName, room_id: &RoomId, pd
 pub(crate) async fn create_leave_event_v1_route(
 	body: Ruma<create_leave_event::v1::Request>,
 ) -> Result<create_leave_event::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
-	create_leave_event(sender_servername, &body.room_id, &body.pdu).await?;
+	create_leave_event(origin, &body.room_id, &body.pdu).await?;
 
 	Ok(create_leave_event::v1::Response::new())
 }
@@ -1471,12 +1675,9 @@ pub(crate) async fn create_leave_event_v1_route(
 pub(crate) async fn create_leave_event_v2_route(
 	body: Ruma<create_leave_event::v2::Request>,
 ) -> Result<create_leave_event::v2::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
-	create_leave_event(sender_servername, &body.room_id, &body.pdu).await?;
+	create_leave_event(origin, &body.room_id, &body.pdu).await?;
 
 	Ok(create_leave_event::v2::Response::new())
 }
@@ -1485,15 +1686,13 @@ pub(crate) async fn create_leave_event_v2_route(
 ///
 /// Invites a remote user to a room.
 pub(crate) async fn create_invite_route(body: Ruma<create_invite::v2::Request>) -> Result<create_invite::v2::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
+	// ACL check origin
 	services()
 		.rooms
 		.event_handler
-		.acl_check(sender_servername, &body.room_id)?;
+		.acl_check(origin, &body.room_id)?;
 
 	if !services()
 		.globals
@@ -1526,10 +1725,10 @@ pub(crate) async fn create_invite_route(body: Ruma<create_invite::v2::Request>) 
 		.globals
 		.config
 		.forbidden_remote_server_names
-		.contains(&sender_servername.to_owned())
+		.contains(origin)
 	{
 		warn!(
-			"Received federated/remote invite from banned server {sender_servername} for room ID {}. Rejecting.",
+			"Received federated/remote invite from banned server {origin} for room ID {}. Rejecting.",
 			body.room_id
 		);
 		return Err(Error::BadRequest(
@@ -1546,6 +1745,28 @@ pub(crate) async fn create_invite_route(body: Ruma<create_invite::v2::Request>) 
 
 	let mut signed_event = utils::to_canonical_object(&body.event)
 		.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Invite event is invalid."))?;
+
+	let invited_user: OwnedUserId = serde_json::from_value(
+		signed_event
+			.get("state_key")
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event has no state_key property."))?
+			.clone()
+			.into(),
+	)
+	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "state_key is not a user ID."))?;
+
+	if !server_is_ours(invited_user.server_name()) {
+		return Err(Error::BadRequest(
+			ErrorKind::InvalidParam,
+			"User does not belong to this homeserver.",
+		));
+	}
+
+	// Make sure we're not ACL'ed from their room.
+	services()
+		.rooms
+		.event_handler
+		.acl_check(invited_user.server_name(), &body.room_id)?;
 
 	ruma::signatures::hash_and_sign_event(
 		services().globals.server_name().as_str(),
@@ -1569,20 +1790,11 @@ pub(crate) async fn create_invite_route(body: Ruma<create_invite::v2::Request>) 
 	let sender: OwnedUserId = serde_json::from_value(
 		signed_event
 			.get("sender")
-			.ok_or(Error::BadRequest(ErrorKind::InvalidParam, "Event had no sender field."))?
+			.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event had no sender property."))?
 			.clone()
 			.into(),
 	)
-	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "sender is not a user id."))?;
-
-	let invited_user: Box<_> = serde_json::from_value(
-		signed_event
-			.get("state_key")
-			.ok_or(Error::BadRequest(ErrorKind::InvalidParam, "Event had no state_key field."))?
-			.clone()
-			.into(),
-	)
-	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "state_key is not a user id."))?;
+	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "sender is not a user ID."))?;
 
 	if services().rooms.metadata.is_banned(&body.room_id)? && !services().users.is_admin(&invited_user)? {
 		return Err(Error::BadRequest(
@@ -1644,10 +1856,7 @@ pub(crate) async fn get_devices_route(body: Ruma<get_devices::v1::Request>) -> R
 		));
 	}
 
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	Ok(get_devices::v1::Response {
 		user_id: body.user_id.clone(),
@@ -1680,10 +1889,10 @@ pub(crate) async fn get_devices_route(body: Ruma<get_devices::v1::Request>) -> R
 			.collect(),
 		master_key: services()
 			.users
-			.get_master_key(None, &body.user_id, &|u| u.server_name() == sender_servername)?,
+			.get_master_key(None, &body.user_id, &|u| u.server_name() == origin)?,
 		self_signing_key: services()
 			.users
-			.get_self_signing_key(None, &body.user_id, &|u| u.server_name() == sender_servername)?,
+			.get_self_signing_key(None, &body.user_id, &|u| u.server_name() == origin)?,
 	})
 }
 
@@ -1697,7 +1906,7 @@ pub(crate) async fn get_room_information_route(
 		.rooms
 		.alias
 		.resolve_local_alias(&body.room_alias)?
-		.ok_or(Error::BadRequest(ErrorKind::NotFound, "Room alias not found."))?;
+		.ok_or_else(|| Error::BadRequest(ErrorKind::NotFound, "Room alias not found."))?;
 
 	let mut servers: Vec<OwnedServerName> = services()
 		.rooms
@@ -1746,7 +1955,7 @@ pub(crate) async fn get_profile_information_route(
 	if !server_is_ours(body.user_id.server_name()) {
 		return Err(Error::BadRequest(
 			ErrorKind::InvalidParam,
-			"User does not belong to this server",
+			"User does not belong to this server.",
 		));
 	}
 
@@ -1792,7 +2001,7 @@ pub(crate) async fn get_keys_route(body: Ruma<get_keys::v1::Request>) -> Result<
 	let result = get_keys_helper(
 		None,
 		&body.device_keys,
-		|u| Some(u.server_name()) == body.sender_servername.as_deref(),
+		|u| Some(u.server_name()) == body.origin.as_deref(),
 		services().globals.allow_device_name_federation(),
 	)
 	.await?;
@@ -1841,16 +2050,13 @@ pub(crate) async fn well_known_server(
 /// Gets the space tree in a depth-first manner to locate child rooms of a given
 /// space.
 pub(crate) async fn get_hierarchy_route(body: Ruma<get_hierarchy::v1::Request>) -> Result<get_hierarchy::v1::Response> {
-	let sender_servername = body
-		.sender_servername
-		.as_ref()
-		.expect("server is authenticated");
+	let origin = body.origin.as_ref().expect("server is authenticated");
 
 	if services().rooms.metadata.exists(&body.room_id)? {
 		services()
 			.rooms
 			.spaces
-			.get_federation_hierarchy(&body.room_id, sender_servername, body.suggested_only)
+			.get_federation_hierarchy(&body.room_id, origin, body.suggested_only)
 			.await
 	} else {
 		Err(Error::BadRequest(ErrorKind::NotFound, "Room does not exist."))
