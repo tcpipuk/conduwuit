@@ -1,0 +1,36 @@
+name: Sync with upstream repository
+
+on:
+    schedule:
+        - cron: "0 7 * * *" # Runs every day at 7am UTC
+    workflow_dispatch: # Allows manual trigger
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v3
+              with:
+                  fetch-depth: 0
+
+            - name: Configure git
+              run: |
+                  git config user.name 'github-actions[bot]'
+                  git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+            - name: Add upstream remote
+              run: git remote add upstream https://github.com/girlbossceo/conduwuit.git
+
+            - name: Fetch upstream
+              run: git fetch upstream
+
+            - name: Merge upstream changes
+              run: git merge upstream/main --allow-unrelated-histories
+
+            - name: Push changes
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/conduwuit.git" HEAD:main

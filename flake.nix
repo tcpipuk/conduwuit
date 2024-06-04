@@ -79,6 +79,11 @@
           # Needed for Complement
           CGO_CFLAGS = "-I${scope.pkgs.olm}/include";
           CGO_LDFLAGS = "-L${scope.pkgs.olm}/lib";
+
+          # Request native compile
+          RUSTFLAGS = "-C target-cpu=native";
+          NIX_CFLAGS_COMPILE = "-march=native -mtune=native";
+          NIX_LDFLAGS = "-march=native -mtune=native";
         };
 
         # Development tools
