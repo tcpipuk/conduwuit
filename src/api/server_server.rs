@@ -54,7 +54,6 @@ use tracing::{debug, error, trace, warn};
 
 use crate::{
 	client_server::{self, claim_keys_helper, get_keys_helper},
-	debug_error,
 	service::{
 		pdu::{gen_event_id_canonical_json, PduBuilder},
 		rooms::event_handler::parse_incoming_pdu,
@@ -74,7 +73,7 @@ pub(crate) async fn get_server_version_route(
 	Ok(get_server_version::v1::Response {
 		server: Some(get_server_version::v1::Server {
 			name: Some("Conduwuit".to_owned()),
-			version: Some(utils::conduwuit_version()),
+			version: Some(conduit::version::conduwuit()),
 		}),
 	})
 }
@@ -89,15 +88,15 @@ pub(crate) async fn get_server_version_route(
 // Response type for this endpoint is Json because we need to calculate a
 // signature for the response
 pub(crate) async fn get_server_keys_route() -> Result<impl IntoResponse> {
-	let mut verify_keys: BTreeMap<OwnedServerSigningKeyId, VerifyKey> = BTreeMap::new();
-	verify_keys.insert(
+	let verify_keys: BTreeMap<OwnedServerSigningKeyId, VerifyKey> = BTreeMap::from([(
 		format!("ed25519:{}", services().globals.keypair().version())
 			.try_into()
 			.expect("found invalid server signing keys in DB"),
 		VerifyKey {
 			key: Base64::new(services().globals.keypair().public_key().to_vec()),
 		},
-	);
+	)]);
+
 	let mut response = serde_json::from_slice(
 		get_server_keys::v2::Response {
 			server_key: Raw::new(&ServerSigningKeys {
@@ -244,7 +243,7 @@ pub(crate) async fn send_transaction_message_route(
 		parsed_pdus.push(match parse_incoming_pdu(pdu) {
 			Ok(t) => t,
 			Err(e) => {
-				warn!("Could not parse PDU: {e}");
+				debug_warn!("Could not parse PDU: {e}");
 				continue;
 			},
 		});
@@ -368,44 +367,32 @@ pub(crate) async fn send_transaction_message_route(
 							continue;
 						}
 
-						if services().rooms.state_cache.is_joined(&user_id, &room_id)? {
-							if let Some((event_id, _)) = user_updates
-								.event_ids
-								.iter()
-								.filter_map(|id| {
-									services()
-										.rooms
-										.timeline
-										.get_pdu_count(id)
-										.ok()
-										.flatten()
-										.map(|r| (id, r))
-								})
-								.max_by_key(|(_, count)| *count)
-							{
-								let mut user_receipts = BTreeMap::new();
-								user_receipts.insert(user_id.clone(), user_updates.data);
+						if services()
+							.rooms
+							.state_cache
+							.room_members(&room_id)
+							.filter_map(Result::ok)
+							.any(|member| member.server_name() == user_id.server_name())
+						{
+							for event_id in &user_updates.event_ids {
+								let user_receipts = BTreeMap::from([(user_id.clone(), user_updates.data.clone())]);
 
-								let mut receipts = BTreeMap::new();
-								receipts.insert(ReceiptType::Read, user_receipts);
+								let receipts = BTreeMap::from([(ReceiptType::Read, user_receipts)]);
 
-								let mut receipt_content = BTreeMap::new();
-								receipt_content.insert(event_id.to_owned(), receipts);
+								let receipt_content = BTreeMap::from([(event_id.to_owned(), receipts)]);
 
 								let event = ReceiptEvent {
 									content: ReceiptEventContent(receipt_content),
 									room_id: room_id.clone(),
 								};
+
 								services()
 									.rooms
 									.read_receipt
 									.readreceipt_update(&user_id, &room_id, event)?;
-							} else {
-								// TODO fetch missing events
-								debug_error!("No known event ids in read receipt: {:?}", user_updates);
 							}
 						} else {
-							debug_warn!(%user_id, %room_id, "received read receipt EDU for user not in room");
+							debug_warn!(%user_id, %room_id, %origin, "received read receipt EDU from server who does not have a single member from their server in the room");
 							continue;
 						}
 					}
@@ -427,7 +414,7 @@ pub(crate) async fn send_transaction_message_route(
 					.acl_check(typing.user_id.server_name(), &typing.room_id)
 					.is_err()
 				{
-					debug_warn!(%typing.user_id, %typing.room_id, "received typing EDU for ACL'd user's server");
+					debug_warn!(%typing.user_id, %typing.room_id, %origin, "received typing EDU for ACL'd user's server");
 					continue;
 				}
 
@@ -457,7 +444,7 @@ pub(crate) async fn send_transaction_message_route(
 							.await?;
 					}
 				} else {
-					debug_warn!(%typing.user_id, %typing.room_id, "received typing EDU for user not in room");
+					debug_warn!(%typing.user_id, %typing.room_id, %origin, "received typing EDU for user not in room");
 					continue;
 				}
 			},
@@ -643,13 +630,17 @@ pub(crate) async fn get_backfill_route(body: Ruma<get_backfill::v1::Request>) ->
 		.max()
 		.ok_or_else(|| Error::BadRequest(ErrorKind::InvalidParam, "Event not found."))?;
 
-	let limit = body.limit.min(uint!(100));
+	let limit = body
+		.limit
+		.min(uint!(100))
+		.try_into()
+		.expect("UInt could not be converted to usize");
 
 	let all_events = services()
 		.rooms
 		.timeline
 		.pdus_until(user_id!("@doesntmatter:conduit.rs"), &body.room_id, until)?
-		.take(limit.try_into().unwrap());
+		.take(limit);
 
 	let events = all_events
 		.filter_map(Result::ok)
@@ -695,11 +686,17 @@ pub(crate) async fn get_missing_events_route(
 		.event_handler
 		.acl_check(origin, &body.room_id)?;
 
-	let mut queued_events = body.latest_events.clone();
-	let mut events = Vec::new();
+	let limit = body
+		.limit
+		.try_into()
+		.expect("UInt could not be converted to usize");
 
-	let mut i = 0;
-	while i < queued_events.len() && events.len() < u64::from(body.limit) as usize {
+	let mut queued_events = body.latest_events.clone();
+	// the vec will never have more entries the limit
+	let mut events = Vec::with_capacity(limit);
+
+	let mut i: usize = 0;
+	while i < queued_events.len() && events.len() < limit {
 		if let Some(pdu) = services().rooms.timeline.get_pdu_json(&queued_events[i])? {
 			let room_id_str = pdu
 				.get("room_id")
@@ -1925,7 +1922,7 @@ pub(crate) async fn get_room_information_route(
 		.iter()
 		.position(|server| server == services().globals.server_name())
 	{
-		servers.remove(server_index);
+		servers.swap_remove(server_index);
 		servers.insert(0, services().globals.server_name().to_owned());
 	}
 

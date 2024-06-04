@@ -1,7 +1,13 @@
 [package]
 name = "conduit_admin"
-version.workspace = true
+categories.workspace = true
+description.workspace = true
 edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [lib]
 path = "mod.rs"
@@ -11,14 +17,6 @@ crate-type = [
 ]
 
 [features]
-default = [
-	"rocksdb",
-	"io_uring",
-	"jemalloc",
-	"zstd_compression",
-	"release_max_log_level",
-]
-
 dev_release_log_level = []
 release_max_log_level = [
 	"tracing/max_level_trace",

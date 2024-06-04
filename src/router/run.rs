@@ -1,11 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use axum_server::Handle as ServerHandle;
-use tokio::{
-	signal,
-	sync::oneshot::{self, Sender},
-};
-use tracing::{debug, info, warn};
+use tokio::sync::broadcast::{self, Sender};
+use tracing::{debug, error, info};
 
 extern crate conduit_admin as admin;
 extern crate conduit_core as conduit;
@@ -24,9 +21,7 @@ use crate::{layers, serve};
 #[tracing::instrument(skip_all)]
 #[allow(clippy::let_underscore_must_use)] // various of these are intended
 pub(crate) async fn run(server: Arc<Server>) -> Result<(), Error> {
-	let config = &server.config;
 	let app = layers::build(&server)?;
-	let addrs = config.get_bind_addrs();
 
 	// Install the admin room callback here for now
 	_ = services().admin.handle.lock().await.insert(admin::handle);
@@ -40,19 +35,11 @@ pub(crate) async fn run(server: Arc<Server>) -> Result<(), Error> {
 		.insert(handle.clone());
 
 	server.interrupt.store(false, Ordering::Release);
-	let (tx, rx) = oneshot::channel::<()>();
-	let sigs = server.runtime().spawn(sighandle(server.clone(), tx));
+	let (tx, _) = broadcast::channel::<()>(1);
+	let sigs = server.runtime().spawn(signal(server.clone(), tx.clone()));
 
-	// Prepare to serve http clients
-	let res;
 	// Serve clients
-	if cfg!(unix) && config.unix_socket_path.is_some() {
-		res = serve::unix_socket(&server, app, rx).await;
-	} else if config.tls.is_some() {
-		res = serve::tls(&server, app, handle.clone(), addrs).await;
-	} else {
-		res = serve::plain(&server, app, handle.clone(), addrs).await;
-	}
+	let res = serve::serve(&server, app, handle, tx.subscribe()).await;
 
 	// Join the signal handler before we leave.
 	sigs.abort();
@@ -66,7 +53,7 @@ pub(crate) async fn run(server: Arc<Server>) -> Result<(), Error> {
 	_ = services().admin.handle.lock().await.take();
 
 	debug_info!("Finished");
-	Ok(res?)
+	res
 }
 
 /// Async initializations
@@ -105,7 +92,7 @@ pub(crate) async fn stop(_server: Arc<Server>) -> Result<(), Error> {
 		.take()
 		.unwrap();
 
-	let s = std::ptr::from_ref(s) as *mut Services;
+	let s: *mut Services = std::ptr::from_ref(s).cast_mut();
 	//SAFETY: Services was instantiated in start() and leaked into the SERVICES
 	// global perusing as 'static for the duration of run_server(). Now we reclaim
 	// it to drop it before unloading the module. If this is not done there will be
@@ -123,51 +110,25 @@ pub(crate) async fn stop(_server: Arc<Server>) -> Result<(), Error> {
 }
 
 #[tracing::instrument(skip_all)]
-async fn sighandle(server: Arc<Server>, tx: Sender<()>) -> Result<(), Error> {
-	let ctrl_c = async {
-		signal::ctrl_c()
-			.await
-			.expect("failed to install Ctrl+C handler");
+async fn signal(server: Arc<Server>, tx: Sender<()>) {
+	let sig: &'static str = server
+		.signal
+		.subscribe()
+		.recv()
+		.await
+		.expect("channel error");
 
+	debug!("Received signal {}", sig);
+	if sig == "Ctrl+C" {
 		let reload = cfg!(unix) && cfg!(debug_assertions);
 		server.reload.store(reload, Ordering::Release);
-	};
-
-	#[cfg(unix)]
-	let ctrl_bs = async {
-		signal::unix::signal(signal::unix::SignalKind::quit())
-			.expect("failed to install Ctrl+\\ handler")
-			.recv()
-			.await;
-	};
-
-	#[cfg(unix)]
-	let terminate = async {
-		signal::unix::signal(signal::unix::SignalKind::terminate())
-			.expect("failed to install SIGTERM handler")
-			.recv()
-			.await;
-	};
-
-	debug!("Installed signal handlers");
-	let sig: &str;
-	#[cfg(unix)]
-	tokio::select! {
-		() = ctrl_c => { sig = "Ctrl+C"; },
-		() = ctrl_bs => { sig = "Ctrl+\\"; },
-		() = terminate => { sig = "SIGTERM"; },
 	}
 
-	#[cfg(not(unix))]
-	tokio::select! {
-		_ = ctrl_c => { sig = "Ctrl+C"; },
-	}
-
-	warn!("Received {}", sig);
 	server.interrupt.store(true, Ordering::Release);
 	services().globals.rotate.fire();
-	tx.send(())
-		.expect("failed sending shutdown transaction to oneshot channel");
+	if let Err(e) = tx.send(()) {
+		error!("failed sending shutdown transaction to channel: {e}");
+	}
 
 	if let Some(handle) = server.shutdown.lock().expect("locked").as_ref() {
 		let pending = server.requests_spawn_active.load(Ordering::Relaxed);
@@ -180,6 +141,4 @@ async fn sighandle(server: Arc<Server>, tx: Sender<()>) -> Result<(), Error> {
 			handle.shutdown();
 		}
 	}
-
-	Ok(())
 }

@@ -69,12 +69,15 @@ script = "cargo fmt --check -- --color=always"
 name = "cargo-doc"
 group = "lints"
 script = """
-RUSTDOCFLAGS="-D warnings" cargo doc \
-    --workspace \
-    --all-features \
-    --no-deps \
-    --document-private-items \
-    --color always
+env DIRENV_DEVSHELL=all-features \
+    RUSTDOCFLAGS="-D warnings" \
+    direnv exec . \
+    cargo doc \
+        --workspace \
+        --all-features \
+        --no-deps \
+        --document-private-items \
+        --color always
 """
 
 [[task]]
@@ -93,13 +96,15 @@ cargo clippy \
 name = "clippy/all"
 group = "lints"
 script = """
-cargo clippy \
-    --workspace \
-    --all-targets \
-    --all-features \
-    --color=always \
-    -- \
-    -D warnings
+env DIRENV_DEVSHELL=all-features \
+    direnv exec . \
+    cargo clippy \
+        --workspace \
+        --all-targets \
+        --all-features \
+        --color=always \
+        -- \
+        -D warnings
 """
 
 [[task]]
@@ -115,18 +120,18 @@ cargo clippy \
     -D warnings
 """
 
-[[task]]
-name = "clippy/hardened_malloc"
-group = "lints"
-script = """
-cargo clippy \
-    --workspace \
-    --features hardened_malloc \
-    --all-targets \
-    --color=always \
-    -- \
-    -D warnings
-"""
+#[[task]]
+#name = "clippy/hardened_malloc"
+#group = "lints"
+#script = """
+#cargo clippy \
+#    --workspace \
+#    --features hardened_malloc \
+#    --all-targets \
+#    --color=always \
+#    -- \
+#    -D warnings
+#"""
 
 [[task]]
 name = "lychee"
@@ -134,13 +139,27 @@ group = "lints"
 script = "lychee --verbose --offline docs *.md"
 
 [[task]]
-name = "cargo"
+name = "cargo/all"
+group = "tests"
+script = """
+env DIRENV_DEVSHELL=all-features \
+    direnv exec . \
+    cargo test \
+        --workspace \
+        --all-targets \
+        --all-features \
+        --color=always \
+        -- \
+        --color=always
+"""
+
+[[task]]
+name = "cargo/default"
 group = "tests"
 script = """
 cargo test \
     --workspace \
     --all-targets \
-    --all-features \
     --color=always \
     -- \
     --color=always

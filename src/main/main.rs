@@ -6,9 +6,10 @@ extern crate conduit_core as conduit;
 
 use std::{cmp, sync::Arc, time::Duration};
 
-use conduit::{debug_info, error, utils::available_parallelism, Error, Result};
+use conduit::{debug_error, debug_info, error, utils::available_parallelism, warn, Error, Result};
 use server::Server;
-use tokio::runtime;
+use tokio::{runtime, signal};
+use tracing::debug;
 
 const WORKER_NAME: &str = "conduwuit:worker";
 const WORKER_MIN: usize = 2;
@@ -25,21 +26,21 @@ fn main() -> Result<(), Error> {
 		.build()
 		.expect("built runtime");
 
-	let handle = runtime.handle();
-	let server: Arc<Server> = Server::build(args, Some(handle))?;
-	runtime.block_on(async { async_main(server.clone()).await })?;
+	let server: Arc<Server> = Server::build(args, Some(runtime.handle()))?;
+	runtime.spawn(signal(server.clone()));
+	runtime.block_on(async_main(&server))?;
 
 	// explicit drop here to trace thread and tls dtors
 	drop(runtime);
-
 	debug_info!("Exit");
+
 	Ok(())
 }
 
 /// Operate the server normally in release-mode static builds. This will start,
 /// run and stop the server within the asynchronous runtime.
 #[cfg(not(conduit_mods))]
-async fn async_main(server: Arc<Server>) -> Result<(), Error> {
+async fn async_main(server: &Arc<Server>) -> Result<(), Error> {
 	extern crate conduit_router as router;
 	use tracing::error;
 
@@ -66,22 +67,22 @@ async fn async_main(server: Arc<Server>) -> Result<(), Error> {
 /// and hot-reload portions of the server as-needed before returning for an
 /// actual shutdown. This is not available in release-mode or static builds.
 #[cfg(conduit_mods)]
-async fn async_main(server: Arc<Server>) -> Result<(), Error> {
+async fn async_main(server: &Arc<Server>) -> Result<(), Error> {
 	let mut starts = true;
 	let mut reloads = true;
 	while reloads {
-		if let Err(error) = mods::open(&server).await {
+		if let Err(error) = mods::open(server).await {
 			error!("Loading router: {error}");
 			return Err(error);
 		}
 
-		let result = mods::run(&server, starts).await;
+		let result = mods::run(server, starts).await;
 		if let Ok(result) = result {
 			(starts, reloads) = result;
 		}
 
 		let force = !reloads || result.is_err();
-		if let Err(error) = mods::close(&server, force).await {
+		if let Err(error) = mods::close(server, force).await {
 			error!("Unloading router: {error}");
 			return Err(error);
 		}
@@ -94,4 +95,35 @@ async fn async_main(server: Arc<Server>) -> Result<(), Error> {
 
 	debug_info!("Exit runtime");
 	Ok(())
+}
+
+#[tracing::instrument(skip_all)]
+async fn signal(server: Arc<Server>) {
+	let (mut term, mut quit);
+	#[cfg(unix)]
+	{
+		use signal::unix;
+		quit = unix::signal(unix::SignalKind::quit()).expect("SIGQUIT handler");
+		term = unix::signal(unix::SignalKind::terminate()).expect("SIGTERM handler");
+	};
+
+	loop {
+		debug!("Installed signal handlers");
+		let sig: &'static str;
+		#[cfg(unix)]
+		tokio::select! {
+			_ = term.recv() => { sig = "SIGTERM"; },
+			_ = quit.recv() => { sig = "Ctrl+\\"; },
+			_ = signal::ctrl_c() => { sig = "Ctrl+C"; },
+		}
+		#[cfg(not(unix))]
+		tokio::select! {
+			_ = signal::ctrl_c() => { sig = "Ctrl+C"; },
+		}
+
+		warn!("Received signal {}", sig);
+		if let Err(e) = server.server.signal.send(sig) {
+			debug_error!("signal channel: {e}");
+		}
+	}
 }

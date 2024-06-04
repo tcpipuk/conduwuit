@@ -182,7 +182,7 @@ impl Service {
 
 	/// Deletes all remote only media files in the given at or after
 	/// time/duration. Returns a u32 with the amount of media files deleted.
-	pub async fn delete_all_remote_media_at_after_time(&self, time: String) -> Result<u32> {
+	pub async fn delete_all_remote_media_at_after_time(&self, time: String) -> Result<usize> {
 		let all_keys = self.db.get_all_media_keys();
 
 		let user_duration: SystemTime = match cyborgtime::parse_duration(&time) {
@@ -278,12 +278,12 @@ impl Service {
 
 		debug!("Deleting media now in the past \"{:?}\".", user_duration);
 
-		let mut deletion_count = 0;
+		let mut deletion_count: usize = 0;
 
 		for mxc in remote_mxcs {
 			debug!("Deleting MXC {mxc} from database and filesystem");
 			self.delete(mxc).await?;
-			deletion_count += 1;
+			deletion_count = deletion_count.saturating_add(1);
 		}
 
 		Ok(deletion_count)
@@ -559,9 +559,7 @@ mod tests {
 			.db
 			.create_file_metadata(None, mxc, width, height, Some(content_disposition), Some(content_type))
 			.unwrap();
-		let mut r = PathBuf::new();
-		r.push("/tmp");
-		r.push("media");
+		let mut r = PathBuf::from("/tmp/media");
 		// r.push(base64::encode_config(key, base64::URL_SAFE_NO_PAD));
 		// use the sha256 hash of the key as the file name instead of the key itself
 		// this is because the base64 encoded key can be longer than 255 characters.

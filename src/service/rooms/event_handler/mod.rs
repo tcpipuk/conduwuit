@@ -118,7 +118,7 @@ impl Service {
 			.ok_or_else(|| Error::bad_database("Failed to find create event in db."))?;
 
 		// Procure the room version
-		let room_version_id = self.get_room_version_id(&create_event)?;
+		let room_version_id = Self::get_room_version_id(&create_event)?;
 
 		let first_pdu_in_room = services()
 			.rooms
@@ -130,7 +130,7 @@ impl Service {
 			.handle_outlier_pdu(origin, &create_event, event_id, room_id, value, false, pub_key_map)
 			.await?;
 
-		self.check_room_id(room_id, &incoming_pdu)?;
+		Self::check_room_id(room_id, &incoming_pdu)?;
 
 		// 8. if not timeline event: stop
 		if !is_timeline_event {
@@ -308,7 +308,7 @@ impl Service {
 
 			// 2. Check signatures, otherwise drop
 			// 3. check content hash, redact if doesn't match
-			let room_version_id = self.get_room_version_id(create_event)?;
+			let room_version_id = Self::get_room_version_id(create_event)?;
 
 			let guard = pub_key_map.read().await;
 			let mut val = match ruma::signatures::verify_event(&guard, &value, &room_version_id) {
@@ -347,7 +347,7 @@ impl Service {
 			)
 			.map_err(|_| Error::bad_database("Event is not a valid PDU."))?;
 
-			self.check_room_id(room_id, &incoming_pdu)?;
+			Self::check_room_id(room_id, &incoming_pdu)?;
 
 			if !auth_events_known {
 				// 4. fetch any missing auth events doing all checks listed here starting at 1.
@@ -375,14 +375,14 @@ impl Service {
 			//    auth events
 			debug!("Checking based on auth events");
 			// Build map of auth events
-			let mut auth_events = HashMap::new();
+			let mut auth_events = HashMap::with_capacity(incoming_pdu.auth_events.len());
 			for id in &incoming_pdu.auth_events {
 				let Some(auth_event) = services().rooms.timeline.get_pdu(id)? else {
 					warn!("Could not find auth event {}", id);
 					continue;
 				};
 
-				self.check_room_id(room_id, &auth_event)?;
+				Self::check_room_id(room_id, &auth_event)?;
 
 				match auth_events.entry((
 					auth_event.kind.to_string().into(),
@@ -417,7 +417,7 @@ impl Service {
 			}
 
 			if !state_res::event_auth::auth_check(
-				&self.to_room_version(&room_version_id),
+				&Self::to_room_version(&room_version_id),
 				&incoming_pdu,
 				None::<PduEvent>, // TODO: third party invite
 				|k, s| auth_events.get(&(k.to_string().into(), s.to_owned())),
@@ -460,7 +460,7 @@ impl Service {
 
 		debug!("Upgrading to timeline pdu");
 		let timer = tokio::time::Instant::now();
-		let room_version_id = self.get_room_version_id(create_event)?;
+		let room_version_id = Self::get_room_version_id(create_event)?;
 
 		// 10. Fetch missing state and auth chain events by calling /state_ids at
 		//     backwards extremities doing all the checks in this list starting at 1.
@@ -488,7 +488,7 @@ impl Service {
 		}
 
 		let state_at_incoming_event = state_at_incoming_event.expect("we always set this to some above");
-		let room_version = self.to_room_version(&room_version_id);
+		let room_version = Self::to_room_version(&room_version_id);
 
 		debug!("Performing auth check");
 		// 11. Check the auth of the event passes based on the state of the event
@@ -671,7 +671,7 @@ impl Service {
 		Ok(pdu_id)
 	}
 
-	async fn resolve_state(
+	pub async fn resolve_state(
 		&self, room_id: &RoomId, room_version_id: &RoomVersionId, incoming_state: HashMap<u64, Arc<EventId>>,
 	) -> Result<Arc<HashSet<CompressedStateEvent>>> {
 		debug!("Loading current room state ids");
@@ -814,7 +814,7 @@ impl Service {
 		&self, incoming_pdu: &Arc<PduEvent>, room_id: &RoomId, room_version_id: &RoomVersionId,
 	) -> Result<Option<HashMap<u64, Arc<EventId>>>> {
 		debug!("Calculating state at event using state res");
-		let mut extremity_sstatehashes = HashMap::new();
+		let mut extremity_sstatehashes = HashMap::with_capacity(incoming_pdu.prev_events.len());
 
 		let mut okay = true;
 		for prev_eventid in &incoming_pdu.prev_events {
@@ -949,7 +949,7 @@ impl Service {
 					.fetch_and_handle_outliers(origin, &collect, create_event, room_id, room_version_id, pub_key_map)
 					.await;
 
-				let mut state: HashMap<_, Arc<EventId>> = HashMap::new();
+				let mut state: HashMap<_, Arc<EventId>> = HashMap::with_capacity(state_vec.len());
 				for (pdu, _) in state_vec {
 					let state_key = pdu
 						.state_key
@@ -1196,7 +1196,7 @@ impl Service {
 		Vec<Arc<EventId>>,
 		HashMap<Arc<EventId>, (Arc<PduEvent>, BTreeMap<String, CanonicalJsonValue>)>,
 	)> {
-		let mut graph: HashMap<Arc<EventId>, _> = HashMap::new();
+		let mut graph: HashMap<Arc<EventId>, _> = HashMap::with_capacity(initial_set.len());
 		let mut eventid_info = HashMap::new();
 		let mut todo_outlier_stack: Vec<Arc<EventId>> = initial_set;
 
@@ -1221,7 +1221,7 @@ impl Service {
 				.await
 				.pop()
 			{
-				self.check_room_id(room_id, &pdu)?;
+				Self::check_room_id(room_id, &pdu)?;
 
 				if amount > services().globals.max_fetch_prev_events() {
 					// Max limit reached
@@ -1242,7 +1242,7 @@ impl Service {
 						.flatten()
 				}) {
 					if pdu.origin_server_ts > first_pdu_in_room.origin_server_ts {
-						amount += 1;
+						amount = amount.saturating_add(1);
 						for prev_prev in &pdu.prev_events {
 							if !graph.contains_key(prev_prev) {
 								todo_outlier_stack.push(prev_prev.clone());
@@ -1329,7 +1329,7 @@ impl Service {
 		}
 	}
 
-	fn check_room_id(&self, room_id: &RoomId, pdu: &PduEvent) -> Result<()> {
+	fn check_room_id(room_id: &RoomId, pdu: &PduEvent) -> Result<()> {
 		if pdu.room_id != room_id {
 			warn!("Found event from room {} in room {}", pdu.room_id, room_id);
 			return Err(Error::BadRequest(ErrorKind::InvalidParam, "Event has wrong room id"));
@@ -1337,7 +1337,7 @@ impl Service {
 		Ok(())
 	}
 
-	fn get_room_version_id(&self, create_event: &PduEvent) -> Result<RoomVersionId> {
+	fn get_room_version_id(create_event: &PduEvent) -> Result<RoomVersionId> {
 		let create_event_content: RoomCreateEventContent =
 			serde_json::from_str(create_event.content.get()).map_err(|e| {
 				error!("Invalid create event: {}", e);
@@ -1347,7 +1347,7 @@ impl Service {
 		Ok(create_event_content.room_version)
 	}
 
-	fn to_room_version(&self, room_version_id: &RoomVersionId) -> RoomVersion {
+	fn to_room_version(room_version_id: &RoomVersionId) -> RoomVersion {
 		RoomVersion::new(room_version_id).expect("room version is supported")
 	}
 }

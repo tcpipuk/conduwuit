@@ -5,7 +5,7 @@ use ruma::{
 	api::client::error::ErrorKind, events::room::message::RoomMessageEventContent, CanonicalJsonObject, EventId,
 	RoomId, RoomVersionId, ServerName,
 };
-use service::{rooms::event_handler::parse_incoming_pdu, sending::send::resolve_actual_dest, services, PduEvent};
+use service::{rooms::event_handler::parse_incoming_pdu, sending::resolve::resolve_actual_dest, services, PduEvent};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -294,8 +294,7 @@ pub(crate) async fn ping(_body: Vec<&str>, server: Box<ServerName>) -> Result<Ro
 			}
 
 			Ok(RoomMessageEventContent::text_plain(format!(
-				"Got non-JSON response which took {ping_time:?} time:\n{0:?}",
-				response
+				"Got non-JSON response which took {ping_time:?} time:\n{response:?}"
 			)))
 		},
 		Err(e) => {
@@ -431,6 +430,48 @@ pub(crate) async fn verify_json(body: Vec<&str>) -> Result<RoomMessageEventConte
 	}
 }
 
+#[tracing::instrument(skip(_body))]
+pub(crate) async fn first_pdu_in_room(_body: Vec<&str>, room_id: Box<RoomId>) -> Result<RoomMessageEventContent> {
+	if !services()
+		.rooms
+		.state_cache
+		.server_in_room(&services().globals.config.server_name, &room_id)?
+	{
+		return Ok(RoomMessageEventContent::text_plain(
+			"We are not participating in the room / we don't know about the room ID.",
+		));
+	}
+
+	let first_pdu = services()
+		.rooms
+		.timeline
+		.first_pdu_in_room(&room_id)?
+		.ok_or_else(|| Error::bad_database("Failed to find the first PDU in database"))?;
+
+	Ok(RoomMessageEventContent::text_plain(format!("{first_pdu:?}")))
+}
+
+#[tracing::instrument(skip(_body))]
+pub(crate) async fn latest_pdu_in_room(_body: Vec<&str>, room_id: Box<RoomId>) -> Result<RoomMessageEventContent> {
+	if !services()
+		.rooms
+		.state_cache
+		.server_in_room(&services().globals.config.server_name, &room_id)?
+	{
+		return Ok(RoomMessageEventContent::text_plain(
+			"We are not participating in the room / we don't know about the room ID.",
+		));
+	}
+
+	let latest_pdu = services()
+		.rooms
+		.timeline
+		.latest_pdu_in_room(&room_id)?
+		.ok_or_else(|| Error::bad_database("Failed to find the latest PDU in database"))?;
+
+	Ok(RoomMessageEventContent::text_plain(format!("{latest_pdu:?}")))
+}
+
 pub(crate) async fn resolve_true_destination(
 	_body: Vec<&str>, server_name: Box<ServerName>, no_cache: bool,
 ) -> Result<RoomMessageEventContent> {
@@ -446,10 +487,10 @@ pub(crate) async fn resolve_true_destination(
 		));
 	}
 
-	let (actual_dest, hostname_uri) = resolve_actual_dest(&server_name, no_cache).await?;
+	let (actual_dest, hostname_uri) = resolve_actual_dest(&server_name, !no_cache).await?;
 
 	Ok(RoomMessageEventContent::text_plain(format!(
-		"Actual destination: {actual_dest:?} | Hostname URI: {hostname_uri}"
+		"Actual destination: {actual_dest} | Hostname URI: {hostname_uri}"
 	)))
 }
 

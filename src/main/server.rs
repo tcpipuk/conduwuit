@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use conduit::{
-	conduwuit_version,
+	config,
 	config::Config,
 	info,
 	log::{LogLevelReloadHandles, ReloadHandle},
-	utils::maximize_fd_limit,
+	utils::sys::maximize_fd_limit,
 	Error, Result,
 };
 use tokio::runtime;
@@ -43,7 +43,7 @@ impl Server {
 			database_path = ?config.database_path,
 			log_levels = %config.log,
 			"{}",
-			conduwuit_version(),
+			conduit::version::conduwuit(),
 		);
 
 		Ok(Arc::new(Server {
@@ -104,7 +104,7 @@ fn init_tracing(config: &Config) -> (LogLevelReloadHandles, TracingFlameGuard) {
 		Ok(s) => s,
 		Err(e) => {
 			eprintln!("It looks like your config is invalid. The following error occured while parsing it: {e}");
-			EnvFilter::try_new("warn").unwrap()
+			EnvFilter::try_new(config::default_log()).expect("failed to set default EnvFilter")
 		},
 	};
 
@@ -140,9 +140,7 @@ fn init_tracing(config: &Config) -> (LogLevelReloadHandles, TracingFlameGuard) {
 			let (flame_layer, flame_guard) =
 				match tracing_flame::FlameLayer::with_file(&config.tracing_flame_output_path) {
 					Ok(ok) => ok,
-					Err(e) => {
-						panic!("failed to initialize tracing-flame: {e}");
-					},
+					Err(e) => panic!("failed to initialize tracing-flame: {e}"),
 				};
 			let flame_layer = flame_layer
 				.with_empty_samples(false)
@@ -176,7 +174,7 @@ fn init_tracing(config: &Config) -> (LogLevelReloadHandles, TracingFlameGuard) {
 	#[cfg_attr(not(feature = "perf_measurements"), allow(clippy::let_unit_value))]
 	let flame_guard = ();
 
-	tracing::subscriber::set_global_default(subscriber).unwrap();
+	tracing::subscriber::set_global_default(subscriber).expect("failed to set global tracing subscriber");
 
 	#[cfg(all(feature = "tokio_console", feature = "release_max_log_level", tokio_unstable))]
 	tracing::error!(

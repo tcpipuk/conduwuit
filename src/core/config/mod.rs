@@ -1,7 +1,7 @@
 use std::{
 	collections::BTreeMap,
 	fmt::{self, Write as _},
-	net::{IpAddr, Ipv6Addr, SocketAddr},
+	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 	path::PathBuf,
 };
 
@@ -36,13 +36,20 @@ struct ListeningPort {
 	ports: Either<u16, Vec<u16>>,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+#[serde(transparent)]
+struct ListeningAddr {
+	#[serde(with = "either::serde_untagged")]
+	addrs: Either<IpAddr, Vec<IpAddr>>,
+}
+
 /// all the config options for conduwuit
 #[derive(Clone, Debug, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Config {
 	/// [`IpAddr`] conduwuit will listen on (can be IPv4 or IPv6)
 	#[serde(default = "default_address")]
-	pub address: IpAddr,
+	address: ListeningAddr,
 	/// default TCP port(s) conduwuit will listen on
 	#[serde(default = "default_port")]
 	port: ListeningPort,
@@ -86,9 +93,6 @@ pub struct Config {
 	pub stateinfo_cache_capacity: u32,
 	#[serde(default = "default_roomid_spacehierarchy_cache_capacity")]
 	pub roomid_spacehierarchy_cache_capacity: u32,
-
-	#[serde(default = "default_cleanup_second_interval")]
-	pub cleanup_second_interval: u32,
 
 	#[serde(default = "default_dns_cache_entries")]
 	pub dns_cache_entries: u32,
@@ -241,8 +245,6 @@ pub struct Config {
 	pub rocksdb_repair: bool,
 	#[serde(default)]
 	pub rocksdb_read_only: bool,
-	#[serde(default)]
-	pub rocksdb_periodic_cleanup: bool,
 	#[serde(default)]
 	pub rocksdb_compaction_prio_idle: bool,
 	#[serde(default = "true_fn")]
@@ -411,7 +413,7 @@ impl Config {
 		};
 
 		// don't start if we're listening on both UNIX sockets and TCP at same time
-		if config.is_dual_listening(&raw_config) {
+		if Self::is_dual_listening(&raw_config) {
 			return Err(Error::bad_config("dual listening on UNIX and TCP sockets not allowed."));
 		};
 
@@ -455,7 +457,7 @@ impl Config {
 
 	/// Checks the presence of the `address` and `unix_socket_path` keys in the
 	/// raw_config, exiting the process if both keys were detected.
-	fn is_dual_listening(&self, raw_config: &Figment) -> bool {
+	fn is_dual_listening(raw_config: &Figment) -> bool {
 		let check_address = raw_config.find_value("address");
 		let check_unix_socket = raw_config.find_value("unix_socket_path");
 
@@ -471,22 +473,27 @@ impl Config {
 
 	#[must_use]
 	pub fn get_bind_addrs(&self) -> Vec<SocketAddr> {
-		match &self.port.ports {
-			Left(port) => {
-				// Left is only 1 value, so make a vec with 1 value only
-				let port_vec = [port];
+		let mut addrs = Vec::new();
+		for host in &self.get_bind_hosts() {
+			for port in &self.get_bind_ports() {
+				addrs.push(SocketAddr::new(*host, *port));
+			}
+		}
 
-				port_vec
-					.iter()
-					.copied()
-					.map(|port| SocketAddr::from((self.address, *port)))
-					.collect::<Vec<_>>()
-			},
-			Right(ports) => ports
-				.iter()
-				.copied()
-				.map(|port| SocketAddr::from((self.address, port)))
-				.collect::<Vec<_>>(),
+		addrs
+	}
+
+	fn get_bind_hosts(&self) -> Vec<IpAddr> {
+		match &self.address.addrs {
+			Left(addr) => vec![*addr],
+			Right(addrs) => addrs.clone(),
+		}
+	}
+
+	fn get_bind_ports(&self) -> Vec<u16> {
+		match &self.port.ports {
+			Left(port) => vec![*port],
+			Right(ports) => ports.clone(),
 		}
 	}
 
@@ -529,7 +536,6 @@ impl fmt::Display for Config {
 				"Roomid space hierarchy cache capacity",
 				&self.roomid_spacehierarchy_cache_capacity.to_string(),
 			),
-			("Cleanup interval in seconds", &self.cleanup_second_interval.to_string()),
 			("DNS cache entry limit", &self.dns_cache_entries.to_string()),
 			("DNS minimum TTL", &self.dns_min_ttl.to_string()),
 			("DNS minimum NXDOMAIN TTL", &self.dns_min_ttl_nxdomain.to_string()),
@@ -738,8 +744,6 @@ impl fmt::Display for Config {
 			#[cfg(feature = "rocksdb")]
 			("RocksDB Read-only Mode", &self.rocksdb_read_only.to_string()),
 			#[cfg(feature = "rocksdb")]
-			("RocksDB Periodic Cleanup", &self.rocksdb_periodic_cleanup.to_string()),
-			#[cfg(feature = "rocksdb")]
 			(
 				"RocksDB Compaction Idle Priority",
 				&self.rocksdb_compaction_prio_idle.to_string(),
@@ -875,7 +879,11 @@ impl fmt::Display for Config {
 
 fn true_fn() -> bool { true }
 
-fn default_address() -> IpAddr { Ipv6Addr::LOCALHOST.into() }
+fn default_address() -> ListeningAddr {
+	ListeningAddr {
+		addrs: Right(vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]),
+	}
+}
 
 fn default_port() -> ListeningPort {
 	ListeningPort {
@@ -912,10 +920,6 @@ fn default_user_visibility_cache_capacity() -> u32 { 100 }
 fn default_stateinfo_cache_capacity() -> u32 { 100 }
 
 fn default_roomid_spacehierarchy_cache_capacity() -> u32 { 100 }
-
-fn default_cleanup_second_interval() -> u32 {
-	1800 // every 30 minutes
-}
 
 fn default_dns_cache_entries() -> u32 { 32768 }
 
@@ -975,7 +979,8 @@ fn default_tracing_flame_output_path() -> String { "./tracing.folded".to_owned()
 
 fn default_trusted_servers() -> Vec<OwnedServerName> { vec![OwnedServerName::try_from("matrix.org").unwrap()] }
 
-fn default_log() -> String {
+#[must_use]
+pub fn default_log() -> String {
 	// do debug logging by default for debug builds
 	if cfg!(debug_assertions) {
 		"debug".to_owned()

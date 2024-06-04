@@ -886,7 +886,7 @@ fn default_power_levels_content(
 
 /// if a room is being created with a room alias, run our checks
 async fn room_alias_check(
-	room_alias_name: &String, appservice_info: &Option<RegistrationInfo>,
+	room_alias_name: &str, appservice_info: &Option<RegistrationInfo>,
 ) -> Result<OwnedRoomAliasId> {
 	// Basic checks on the room alias validity
 	if room_alias_name.contains(':') {
@@ -899,20 +899,6 @@ async fn room_alias_check(
 		return Err(Error::BadRequest(
 			ErrorKind::InvalidParam,
 			"Room alias contained spaces which is not a valid room alias.",
-		));
-	} else if room_alias_name.len() > 255 {
-		// there is nothing spec-wise saying to check the limit of this,
-		// however absurdly long room aliases are guaranteed to be unreadable or done
-		// maliciously. there is no reason a room alias should even exceed 100
-		// characters as is. generally in spec, 255 is matrix's fav number
-		return Err(Error::BadRequest(
-			ErrorKind::InvalidParam,
-			"Room alias is excessively long, clients may not be able to handle this. Please shorten it.",
-		));
-	} else if room_alias_name.contains('"') {
-		return Err(Error::BadRequest(
-			ErrorKind::InvalidParam,
-			"Room alias contained `\"` which is not allowed.",
 		));
 	}
 
@@ -958,7 +944,7 @@ async fn room_alias_check(
 }
 
 /// if a room is being created with a custom room ID, run our checks against it
-fn custom_room_id_check(custom_room_id: &String) -> Result<OwnedRoomId> {
+fn custom_room_id_check(custom_room_id: &str) -> Result<OwnedRoomId> {
 	// apply forbidden room alias checks to custom room IDs too
 	if services()
 		.globals
@@ -979,8 +965,6 @@ fn custom_room_id_check(custom_room_id: &String) -> Result<OwnedRoomId> {
 			ErrorKind::InvalidParam,
 			"Custom room ID contained spaces which is not valid.",
 		));
-	} else if custom_room_id.len() > 255 {
-		return Err(Error::BadRequest(ErrorKind::InvalidParam, "Custom room ID is too long."));
 	}
 
 	let full_room_id = format!("!{}:{}", custom_room_id, services().globals.config.server_name);

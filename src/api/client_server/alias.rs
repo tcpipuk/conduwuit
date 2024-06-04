@@ -8,7 +8,7 @@ use ruma::{
 		},
 		federation,
 	},
-	OwnedRoomAliasId, OwnedRoomId, OwnedServerName,
+	OwnedRoomAliasId, OwnedServerName, RoomAliasId, RoomId,
 };
 use tracing::debug;
 
@@ -119,7 +119,7 @@ pub async fn get_alias_helper(
 			)
 			.await;
 
-		debug_info!("room alias server_name get_alias_helper response: {response:?}");
+		debug!("room alias server_name get_alias_helper response: {response:?}");
 
 		if let Err(ref e) = response {
 			debug_info!(
@@ -140,7 +140,7 @@ pub async fn get_alias_helper(
 							},
 						)
 						.await;
-					debug_info!("Got response from server {server} for room aliases: {response:?}");
+					debug!("Got response from server {server} for room aliases: {response:?}");
 
 					if let Ok(ref response) = response {
 						if !response.servers.is_empty() {
@@ -162,7 +162,7 @@ pub async fn get_alias_helper(
 			pre_servers.push(room_alias.server_name().into());
 
 			let servers = room_available_servers(&room_id, &room_alias, &Some(pre_servers));
-			debug_warn!(
+			debug!(
 				"room alias servers from federation response for room ID {room_id} and room alias {room_alias}: \
 				 {servers:?}"
 			);
@@ -213,13 +213,13 @@ pub async fn get_alias_helper(
 
 	let servers = room_available_servers(&room_id, &room_alias, &None);
 
-	debug_warn!("room alias servers for room ID {room_id} and room alias {room_alias}");
+	debug!("room alias servers for room ID {room_id} and room alias {room_alias}");
 
 	Ok(get_alias::v3::Response::new(room_id, servers))
 }
 
 fn room_available_servers(
-	room_id: &OwnedRoomId, room_alias: &OwnedRoomAliasId, pre_servers: &Option<Vec<OwnedServerName>>,
+	room_id: &RoomId, room_alias: &RoomAliasId, pre_servers: &Option<Vec<OwnedServerName>>,
 ) -> Vec<OwnedServerName> {
 	// find active servers in room state cache to suggest
 	let mut servers: Vec<OwnedServerName> = services()
@@ -247,20 +247,20 @@ fn room_available_servers(
 		.iter()
 		.position(|server_name| server_is_ours(server_name))
 	{
-		servers.remove(server_index);
+		servers.swap_remove(server_index);
 		servers.insert(0, services().globals.server_name().to_owned());
 	} else if let Some(alias_server_index) = servers
 		.iter()
 		.position(|server| server == room_alias.server_name())
 	{
-		servers.remove(alias_server_index);
+		servers.swap_remove(alias_server_index);
 		servers.insert(0, room_alias.server_name().into());
 	}
 
 	servers
 }
 
-async fn alias_checks(room_alias: &OwnedRoomAliasId, appservice_info: &Option<RegistrationInfo>) -> Result<()> {
+async fn alias_checks(room_alias: &RoomAliasId, appservice_info: &Option<RegistrationInfo>) -> Result<()> {
 	if !server_is_ours(room_alias.server_name()) {
 		return Err(Error::BadRequest(ErrorKind::InvalidParam, "Alias is from another server."));
 	}

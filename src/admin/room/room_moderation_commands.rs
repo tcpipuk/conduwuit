@@ -185,7 +185,7 @@ pub(crate) async fn process(command: RoomModerationCommand, body: Vec<&str>) -> 
 					.try_into()
 					.expect("#admins:server_name is a valid alias name");
 
-				let mut room_ban_count = 0;
+				let mut room_ban_count: usize = 0;
 				let mut room_ids: Vec<OwnedRoomId> = Vec::new();
 
 				for &room in &rooms_s {
@@ -297,7 +297,7 @@ pub(crate) async fn process(command: RoomModerationCommand, body: Vec<&str>) -> 
 				for room_id in room_ids {
 					if services().rooms.metadata.ban_room(&room_id, true).is_ok() {
 						debug!("Banned {room_id} successfully");
-						room_ban_count += 1;
+						room_ban_count = room_ban_count.saturating_add(1);
 					}
 
 					debug!("Making all users leave the room {}", &room_id);
@@ -481,7 +481,7 @@ pub(crate) async fn process(command: RoomModerationCommand, body: Vec<&str>) -> 
 					// as the room name if we dont have it TODO: do same if we have a room alias for
 					// this
 					let plain_list = room_ids.iter().fold(String::new(), |mut output, room_id| {
-						writeln!(output, "- `{}`", room_id).unwrap();
+						writeln!(output, "- `{room_id}`").unwrap();
 						output
 					});
 
@@ -490,16 +490,13 @@ pub(crate) async fn process(command: RoomModerationCommand, body: Vec<&str>) -> 
 						output
 					});
 
-					let plain = format!("Rooms:\n{}", plain_list);
-					let html = format!("Rooms:\n<ul>{}</ul>", html_list);
+					let plain = format!("Rooms:\n{plain_list}");
+					let html = format!("Rooms:\n<ul>{html_list}</ul>");
 					Ok(RoomMessageEventContent::text_html(plain, html))
 				},
 				Err(e) => {
 					error!("Failed to list banned rooms: {}", e);
-					Ok(RoomMessageEventContent::text_plain(format!(
-						"Unable to list room aliases: {}",
-						e
-					)))
+					Ok(RoomMessageEventContent::text_plain(format!("Unable to list room aliases: {e}")))
 				},
 			}
 		},

@@ -6,11 +6,8 @@ use std::{
 use conduit::{debug_info, Result, Server};
 use database::KeyValueDatabase;
 use lru_cache::LruCache;
-use tokio::{
-	fs,
-	sync::{broadcast, Mutex, RwLock},
-};
-use tracing::{debug, info, trace, warn};
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tracing::{debug, info, trace};
 
 use crate::{
 	account_data, admin, appservice, globals, key_backups, media, presence, pusher, rooms, sending, transaction_ids,
@@ -292,7 +289,7 @@ bad_signature_ratelimiter: {bad_signature_ratelimiter}
 		}
 
 		if self.globals.allow_check_for_updates() {
-			let handle = globals::updates::start_check_for_updates_task().await?;
+			let handle = globals::updates::start_check_for_updates_task();
 
 			#[allow(clippy::let_underscore_must_use)] // needed for shutdown
 			{
@@ -320,13 +317,6 @@ bad_signature_ratelimiter: {bad_signature_ratelimiter}
 	pub async fn shutdown(&self) {
 		info!("Shutting down services");
 		self.interrupt().await;
-
-		debug!("Removing unix socket file.");
-		if let Some(path) = self.globals.unix_socket_path().as_ref() {
-			if let Err(e) = fs::remove_file(path).await {
-				warn!("Failed to remove UNIX socket file: {e}");
-			}
-		}
 
 		debug!("Waiting for update worker...");
 		if let Some(updates_handle) = self.globals.updates_handle.lock().await.take() {

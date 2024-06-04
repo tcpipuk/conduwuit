@@ -83,6 +83,14 @@ impl Service {
 	}
 
 	#[tracing::instrument(skip(self))]
+	pub fn latest_pdu_in_room(&self, room_id: &RoomId) -> Result<Option<Arc<PduEvent>>> {
+		self.all_pdus(user_id!("@placeholder:conduwuit.placeholder"), room_id)?
+			.last()
+			.map(|o| o.map(|(_, p)| Arc::new(p)))
+			.transpose()
+	}
+
+	#[tracing::instrument(skip(self))]
 	pub fn last_timeline_count(&self, sender_user: &UserId, room_id: &RoomId) -> Result<PduCount> {
 		self.db.last_timeline_count(sender_user, room_id)
 	}
@@ -195,7 +203,7 @@ impl Service {
 		state_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<Vec<u8>> {
 		// Coalesce database writes for the remainder of this scope.
-		let _cork = services().globals.cork_and_flush()?;
+		let _cork = services().globals.db.cork_and_flush();
 
 		let shortroomid = services()
 			.rooms
@@ -1070,7 +1078,7 @@ impl Service {
 			.into_iter()
 			.position(|server_name| server_is_ours(&server_name))
 		{
-			servers.remove(server_index);
+			servers.swap_remove(server_index);
 		}
 
 		servers.sort_unstable();

@@ -1,7 +1,13 @@
 [package]
 name = "rust-rocksdb-uwu"
-version = "0.0.1"
+categories.workspace = true
+description = "dylib wrapper for rust-rocksdb"
 edition = "2021"
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+version = "0.0.1"
 
 [features]
 default = ["snappy", "lz4", "zstd", "zlib", "bzip2"]
@@ -21,7 +27,8 @@ malloc-usable-size = ["rust-rocksdb/malloc-usable-size"]
 
 [dependencies.rust-rocksdb]
 git = "https://github.com/zaidoon1/rust-rocksdb"
-branch = "master"
+rev = "e9e1cb5ba92a44ea225fe8d13b31aa23621b9035"
+#branch = "master"
 default-features = false
 
 [lib]

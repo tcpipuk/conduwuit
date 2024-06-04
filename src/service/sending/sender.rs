@@ -80,12 +80,12 @@ impl Service {
 	) {
 		match response {
 			Ok(dest) => self.handle_response_ok(&dest, futures, statuses),
-			Err((dest, e)) => self.handle_response_err(dest, futures, statuses, &e),
+			Err((dest, e)) => Self::handle_response_err(dest, futures, statuses, &e),
 		};
 	}
 
 	fn handle_response_err(
-		&self, dest: Destination, _futures: &mut SendingFutures<'_>, statuses: &mut CurTransactionStatus, e: &Error,
+		dest: Destination, _futures: &mut SendingFutures<'_>, statuses: &mut CurTransactionStatus, e: &Error,
 	) {
 		debug!(dest = ?dest, "{e:?}");
 		statuses.entry(dest).and_modify(|e| {
@@ -100,7 +100,7 @@ impl Service {
 	fn handle_response_ok(
 		&self, dest: &Destination, futures: &mut SendingFutures<'_>, statuses: &mut CurTransactionStatus,
 	) {
-		let _cork = services().globals.cork();
+		let _cork = services().globals.db.cork();
 		self.db
 			.delete_all_active_requests_for(dest)
 			.expect("all active requests deleted");
@@ -173,7 +173,7 @@ impl Service {
 			return Ok(None);
 		}
 
-		let _cork = services().globals.cork();
+		let _cork = services().globals.db.cork();
 		let mut events = Vec::new();
 
 		// Must retry any previous transaction for this remote.
@@ -187,7 +187,7 @@ impl Service {
 		}
 
 		// Compose the next transaction
-		let _cork = services().globals.cork();
+		let _cork = services().globals.db.cork();
 		if !new_events.is_empty() {
 			self.db.mark_as_active(&new_events)?;
 			for (e, _) in new_events {
@@ -406,7 +406,7 @@ async fn send_events(dest: Destination, events: Vec<SendingEvent>) -> SendingRes
 }
 
 #[tracing::instrument(skip(dest, events))]
-async fn send_events_dest_appservice(dest: &Destination, id: &String, events: Vec<SendingEvent>) -> SendingResult {
+async fn send_events_dest_appservice(dest: &Destination, id: &str, events: Vec<SendingEvent>) -> SendingResult {
 	let mut pdu_jsons = Vec::new();
 
 	for event in &events {
@@ -469,7 +469,7 @@ async fn send_events_dest_appservice(dest: &Destination, id: &String, events: Ve
 
 #[tracing::instrument(skip(dest, events))]
 async fn send_events_dest_push(
-	dest: &Destination, userid: &OwnedUserId, pushkey: &String, events: Vec<SendingEvent>,
+	dest: &Destination, userid: &OwnedUserId, pushkey: &str, events: Vec<SendingEvent>,
 ) -> SendingResult {
 	let mut pdus = Vec::new();
 

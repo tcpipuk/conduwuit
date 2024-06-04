@@ -1,5 +1,3 @@
-use infer::MatcherType;
-
 use crate::debug_info;
 
 const ATTACHMENT: &str = "attachment";
@@ -7,34 +5,53 @@ const INLINE: &str = "inline";
 const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 const IMAGE_SVG_XML: &str = "image/svg+xml";
 
+/// as defined by MSC2702
+const ALLOWED_INLINE_CONTENT_TYPES: [&str; 26] = [
+	"text/css",
+	"text/plain",
+	"text/csv",
+	"application/json",
+	"application/ld+json",
+	"image/jpeg",
+	"image/gif",
+	"image/png",
+	"image/apng",
+	"image/webp",
+	"image/avif",
+	"video/mp4",
+	"video/webm",
+	"video/ogg",
+	"video/quicktime",
+	"audio/mp4",
+	"audio/webm",
+	"audio/aac",
+	"audio/mpeg",
+	"audio/ogg",
+	"audio/wave",
+	"audio/wav",
+	"audio/x-wav",
+	"audio/x-pn-wav",
+	"audio/flac",
+	"audio/x-flac",
+];
+
 /// Returns a Content-Disposition of `attachment` or `inline`, depending on the
 /// *parsed* contents of the file uploaded via format magic keys using `infer`
 /// crate (basically libmagic without needing libmagic).
-///
-/// This forbids trusting what the client or remote server says the file is from
-/// their `Content-Type` and we try to detect it ourselves. Also returns
-/// `attachment` if the Content-Type does not match what we detected.
-///
-/// TODO: add a "strict" function for comparing the Content-Type with what we
-/// detected: `file_type.mime_type() != content_type`
 #[must_use]
 #[tracing::instrument(skip(buf))]
 pub fn content_disposition_type(buf: &[u8], content_type: &Option<String>) -> &'static str {
 	let Some(file_type) = infer::get(buf) else {
+		debug_info!("Failed to infer the file's contents, assuming attachment for Content-Disposition");
 		return ATTACHMENT;
 	};
 
-	debug_info!("MIME type: {}", file_type.mime_type());
+	debug_info!("detected MIME type: {}", file_type.mime_type());
 
-	match file_type.matcher_type() {
-		MatcherType::Image | MatcherType::Audio | MatcherType::Text | MatcherType::Video => {
-			if file_type.mime_type().contains("xml") {
-				ATTACHMENT
-			} else {
-				INLINE
-			}
-		},
-		_ => ATTACHMENT,
+	if ALLOWED_INLINE_CONTENT_TYPES.contains(&file_type.mime_type()) {
+		INLINE
+	} else {
+		ATTACHMENT
 	}
 }
 
@@ -45,13 +62,13 @@ pub fn content_disposition_type(buf: &[u8], content_type: &Option<String>) -> &'
 #[must_use]
 #[tracing::instrument(skip(buf))]
 pub fn make_content_type(buf: &[u8], content_type: &Option<String>) -> &'static str {
-	let Some(file_type) = infer::get(buf) else {
-		debug_info!("Failed to infer the file's contents");
+	let Some(claimed_content_type) = content_type else {
 		return APPLICATION_OCTET_STREAM;
 	};
 
-	let Some(claimed_content_type) = content_type else {
-		return file_type.mime_type();
+	let Some(file_type) = infer::get(buf) else {
+		debug_info!("Failed to infer the file's contents");
+		return APPLICATION_OCTET_STREAM;
 	};
 
 	if claimed_content_type.contains("svg") && file_type.mime_type().contains("xml") {
@@ -127,9 +144,9 @@ mod tests {
 		};
 
 		// cargo test -- --nocapture
-		println!("{}", SAMPLE);
+		println!("{SAMPLE}");
 		println!("{}", sanitize_filename::sanitize_with_options(SAMPLE, options.clone()));
-		println!("{:?}", SAMPLE);
+		println!("{SAMPLE:?}");
 		println!("{:?}", sanitize_filename::sanitize_with_options(SAMPLE, options.clone()));
 
 		assert_eq!(SANITISED, sanitize_filename::sanitize_with_options(SAMPLE, options.clone()));
