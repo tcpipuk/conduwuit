@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use data::Data;
 use itertools::Itertools;
@@ -212,11 +212,6 @@ impl Service {
 	#[tracing::instrument(skip(self, room_id))]
 	pub fn update_joined_count(&self, room_id: &RoomId) -> Result<()> { self.db.update_joined_count(room_id) }
 
-	#[tracing::instrument(skip(self, room_id))]
-	pub fn get_our_real_users(&self, room_id: &RoomId) -> Result<Arc<HashSet<OwnedUserId>>> {
-		self.db.get_our_real_users(room_id)
-	}
-
 	#[tracing::instrument(skip(self, room_id, appservice))]
 	pub fn appservice_in_room(&self, room_id: &RoomId, appservice: &RegistrationInfo) -> Result<bool> {
 		self.db.appservice_in_room(room_id, appservice)
@@ -277,6 +272,30 @@ impl Service {
 
 	#[tracing::instrument(skip(self))]
 	pub fn room_joined_count(&self, room_id: &RoomId) -> Result<Option<u64>> { self.db.room_joined_count(room_id) }
+
+	#[tracing::instrument(skip(self))]
+	/// Returns an iterator of all our local users in the room, even if they're
+	/// deactivated/guests
+	pub fn local_users_in_room<'a>(&'a self, room_id: &RoomId) -> impl Iterator<Item = OwnedUserId> + 'a {
+		self.db.local_users_in_room(room_id)
+	}
+
+	#[tracing::instrument(skip(self))]
+	/// Returns an iterator of all our local users in a room who are active (not
+	/// deactivated, not guest)
+	pub fn active_local_users_in_room<'a>(&'a self, room_id: &RoomId) -> impl Iterator<Item = OwnedUserId> + 'a {
+		self.db.active_local_users_in_room(room_id)
+	}
+
+	#[tracing::instrument(skip(self))]
+	/// Returns an iterator of all our local users joined in a room who are
+	/// active (not deactivated, not guest) and have a joined membership state
+	/// in the room
+	pub fn active_local_joined_users_in_room<'a>(
+		&'a self, room_id: &'a RoomId,
+	) -> impl Iterator<Item = OwnedUserId> + 'a {
+		self.db.active_local_joined_users_in_room(room_id)
+	}
 
 	#[tracing::instrument(skip(self))]
 	pub fn room_invited_count(&self, room_id: &RoomId) -> Result<Option<u64>> { self.db.room_invited_count(room_id) }
