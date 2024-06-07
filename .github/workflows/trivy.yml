@@ -18,18 +18,18 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v4
 
-      - name: Run Trivy code and vulnerability scanner on repo
-        uses: aquasecurity/trivy-action@0.22.0
-        with:
-          scan-type: repo
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH,MEDIUM,LOW
+            - name: Run Trivy code and vulnerability scanner on repo
+              uses: aquasecurity/trivy-action@0.22.0
+              with:
+                  scan-type: repo
+                  format: sarif
+                  output: trivy-results.sarif
+                  severity: CRITICAL,HIGH,MEDIUM,LOW
 
-      - name: Run Trivy code and vulnerability scanner on filesystem
-        uses: aquasecurity/trivy-action@0.22.0
-        with:
-          scan-type: fs
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH,MEDIUM,LOW
+            - name: Run Trivy code and vulnerability scanner on filesystem
+              uses: aquasecurity/trivy-action@0.22.0
+              with:
+                  scan-type: fs
+                  format: sarif
+                  output: trivy-results.sarif
+                  severity: CRITICAL,HIGH,MEDIUM,LOW
