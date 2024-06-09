@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use itertools::Itertools;
 use ruma::{
-	events::{room::member::MembershipState, AnyStrippedStateEvent, AnySyncStateEvent},
+	events::{AnyStrippedStateEvent, AnySyncStateEvent},
 	serde::Raw,
 	OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName, UserId,
 };
@@ -50,16 +50,9 @@ pub trait Data: Send + Sync {
 	/// in the room, even if they're deactivated/guests
 	fn local_users_in_room<'a>(&'a self, room_id: &RoomId) -> Box<dyn Iterator<Item = OwnedUserId> + 'a>;
 
-	/// Returns an iterator of all our local users in a room who are active (not
-	/// deactivated, not guest)
+	/// Returns an iterator of all our local joined users in a room who are
+	/// active (not deactivated, not guest)
 	fn active_local_users_in_room<'a>(&'a self, room_id: &RoomId) -> Box<dyn Iterator<Item = OwnedUserId> + 'a>;
-
-	/// Returns an iterator of all our local users joined in a room who are
-	/// active (not deactivated, not guest) and have a joined membership state
-	/// in the room
-	fn active_local_joined_users_in_room<'a>(
-		&'a self, room_id: &'a RoomId,
-	) -> Box<dyn Iterator<Item = OwnedUserId> + 'a>;
 
 	fn room_joined_count(&self, room_id: &RoomId) -> Result<Option<u64>>;
 
@@ -121,10 +114,8 @@ impl Data for KeyValueDatabase {
 
 	fn mark_as_joined(&self, user_id: &UserId, room_id: &RoomId) -> Result<()> {
 		let roomid = room_id.as_bytes().to_vec();
-		let mut roomid_prefix = room_id.as_bytes().to_vec();
-		roomid_prefix.push(0xFF);
 
-		let mut roomuser_id = roomid_prefix.clone();
+		let mut roomuser_id = roomid.clone();
 		roomuser_id.push(0xFF);
 		roomuser_id.extend_from_slice(user_id.as_bytes());
 
@@ -139,13 +130,10 @@ impl Data for KeyValueDatabase {
 		self.userroomid_leftstate.remove(&userroom_id)?;
 		self.roomuserid_leftcount.remove(&roomuser_id)?;
 
-		if self
-			.roomuserid_joined
-			.scan_prefix(roomid_prefix.clone())
-			.count() == 0
+		if self.roomuserid_joined.scan_prefix(roomid.clone()).count() == 0
 			&& self
 				.roomuserid_invitecount
-				.scan_prefix(roomid_prefix)
+				.scan_prefix(roomid.clone())
 				.count() == 0
 		{
 			self.roomid_inviteviaservers.remove(&roomid)?;
@@ -198,10 +186,9 @@ impl Data for KeyValueDatabase {
 
 	fn mark_as_left(&self, user_id: &UserId, room_id: &RoomId) -> Result<()> {
 		let roomid = room_id.as_bytes().to_vec();
-		let mut roomid_prefix = room_id.as_bytes().to_vec();
-		roomid_prefix.push(0xFF);
 
-		let mut roomuser_id = roomid_prefix.clone();
+		let mut roomuser_id = roomid.clone();
+		roomuser_id.push(0xFF);
 		roomuser_id.extend_from_slice(user_id.as_bytes());
 
 		let mut userroom_id = user_id.as_bytes().to_vec();
@@ -219,13 +206,10 @@ impl Data for KeyValueDatabase {
 		self.userroomid_invitestate.remove(&userroom_id)?;
 		self.roomuserid_invitecount.remove(&roomuser_id)?;
 
-		if self
-			.roomuserid_joined
-			.scan_prefix(roomid_prefix.clone())
-			.count() == 0
+		if self.roomuserid_joined.scan_prefix(roomid.clone()).count() == 0
 			&& self
 				.roomuserid_invitecount
-				.scan_prefix(roomid_prefix)
+				.scan_prefix(roomid.clone())
 				.count() == 0
 		{
 			self.roomid_inviteviaservers.remove(&roomid)?;
@@ -421,33 +405,14 @@ impl Data for KeyValueDatabase {
 		)
 	}
 
-	/// Returns an iterator of all our local users in a room who are active (not
-	/// deactivated, not guest)
+	/// Returns an iterator of all our local joined users in a room who are
+	/// active (not deactivated, not guest)
 	#[tracing::instrument(skip(self))]
 	fn active_local_users_in_room<'a>(&'a self, room_id: &RoomId) -> Box<dyn Iterator<Item = OwnedUserId> + 'a> {
 		Box::new(
 			self.local_users_in_room(room_id)
 				.filter(|user| !services().users.is_deactivated(user).unwrap_or(true)),
 		)
-	}
-
-	/// Returns an iterator of all our local users joined in a room who are
-	/// active (not deactivated, not guest) and have a joined membership state
-	/// in the room
-	///
-	/// TODO: why is `roomuserid_joined` not reliable?
-	#[tracing::instrument(skip(self))]
-	fn active_local_joined_users_in_room<'a>(
-		&'a self, room_id: &'a RoomId,
-	) -> Box<dyn Iterator<Item = OwnedUserId> + 'a> {
-		Box::new(self.active_local_users_in_room(room_id).filter(|user_id| {
-			services()
-				.rooms
-				.state_accessor
-				.get_member(room_id, user_id)
-				.unwrap_or(None)
-				.map_or(false, |membership| membership.membership == MembershipState::Join)
-		}))
 	}
 
 	/// Returns the number of users which are currently in a room
