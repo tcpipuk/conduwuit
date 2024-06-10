@@ -108,7 +108,7 @@ impl Arena {
 			//    whole space tree.
 			//
 			// You should only ever encounter a traversed node when going up through parents
-			while let Some(true) = self.traversed(current) {
+			while self.traversed(current) == Some(true) {
 				if let Some(next) = self.next_sibling(current) {
 					current = next;
 				} else if let Some(parent) = self.parent(current) {
@@ -211,7 +211,7 @@ impl Arena {
 	fn new(root: OwnedRoomId, max_depth: usize) -> Self {
 		let zero_depth = max_depth == 0;
 
-		Arena {
+		Self {
 			nodes: vec![Node {
 				parent: None,
 				next_sibling: None,
@@ -233,7 +233,7 @@ impl Arena {
 }
 
 // Note: perhaps use some better form of token rather than just room count
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PagnationToken {
 	pub skip: UInt,
 	pub limit: UInt,
@@ -248,7 +248,7 @@ impl FromStr for PagnationToken {
 		let mut values = value.split('_');
 
 		let mut pag_tok = || {
-			Some(PagnationToken {
+			Some(Self {
 				skip: UInt::from_str(values.next()?).ok()?,
 				limit: UInt::from_str(values.next()?).ok()?,
 				max_depth: UInt::from_str(values.next()?).ok()?,
@@ -316,7 +316,7 @@ impl From<CachedSpaceHierarchySummary> for SpaceHierarchyRoomsChunk {
 			..
 		} = value.summary;
 
-		SpaceHierarchyRoomsChunk {
+		Self {
 			canonical_alias,
 			name,
 			num_joined_members,
@@ -821,12 +821,15 @@ fn is_accessable_child_recurse(
 			SpaceRoomJoinRule::Restricted => {
 				for room in allowed_room_ids {
 					if let Ok((join_rule, allowed_room_ids)) = get_join_rule(room) {
-						if let Ok(true) = is_accessable_child_recurse(
-							room,
-							&join_rule,
-							identifier,
-							&allowed_room_ids,
-							recurse_num + 1,
+						if matches!(
+							is_accessable_child_recurse(
+								room,
+								&join_rule,
+								identifier,
+								&allowed_room_ids,
+								recurse_num + 1,
+							),
+							Ok(true)
 						) {
 							return Ok(true);
 						}

@@ -219,7 +219,7 @@ impl Service {
 	#[tracing::instrument(skip(self, request), name = "request")]
 	pub async fn send_federation_request<T>(&self, dest: &ServerName, request: T) -> Result<T::IncomingResponse>
 	where
-		T: OutgoingRequest + Debug,
+		T: OutgoingRequest + Debug + Send,
 	{
 		let client = &services().globals.client.federation;
 		send::send(client, dest, request).await
@@ -233,7 +233,7 @@ impl Service {
 		&self, registration: Registration, request: T,
 	) -> Result<Option<T::IncomingResponse>>
 	where
-		T: OutgoingRequest + Debug,
+		T: OutgoingRequest + Debug + Send,
 	{
 		appservice::send_request(registration, request).await
 	}
@@ -259,19 +259,19 @@ impl Destination {
 	#[tracing::instrument(skip(self))]
 	pub fn get_prefix(&self) -> Vec<u8> {
 		let mut prefix = match self {
-			Destination::Appservice(server) => {
+			Self::Appservice(server) => {
 				let mut p = b"+".to_vec();
 				p.extend_from_slice(server.as_bytes());
 				p
 			},
-			Destination::Push(user, pushkey) => {
+			Self::Push(user, pushkey) => {
 				let mut p = b"$".to_vec();
 				p.extend_from_slice(user.as_bytes());
 				p.push(0xFF);
 				p.extend_from_slice(pushkey.as_bytes());
 				p
 			},
-			Destination::Normal(server) => {
+			Self::Normal(server) => {
 				let mut p = Vec::new();
 				p.extend_from_slice(server.as_bytes());
 				p

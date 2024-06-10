@@ -715,20 +715,12 @@ correctness = "warn"
 nursery = "warn"
 
 ## some sadness
-branches_sharing_code = { level = "allow", priority = 1 }            # TODO
-derive_partial_eq_without_eq = { level = "allow", priority = 1 }     # TODO
-equatable_if_let = { level = "allow", priority = 1 }                 # TODO
-future_not_send = { level = "allow", priority = 1 }                  # TODO
 missing_const_for_fn = { level = "allow", priority = 1 }             # TODO
 needless_collect = { level = "allow", priority = 1 }                 # TODO
-needless_pass_by_ref_mut = { level = "allow", priority = 1 }         # TODO
 option_if_let_else = { level = "allow", priority = 1 }               # TODO
 redundant_pub_crate = { level = "allow", priority = 1 }              # TODO
 significant_drop_in_scrutinee = { level = "allow", priority = 1 }    # TODO
 significant_drop_tightening = { level = "allow", priority = 1 }      # TODO
-suboptimal_flops = { level = "allow", priority = 1 }                 # TODO
-use_self = { level = "allow", priority = 1 }                         # TODO
-useless_let_if_seq = { level = "allow", priority = 1 }               # TODO
 
 ###################
 pedantic = "warn"

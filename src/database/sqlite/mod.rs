@@ -109,11 +109,11 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
 			clippy::cast_sign_loss
 		)]
 		let cache_size_per_thread = ((config.db_cache_capacity_mb * 1024.0)
-			/ ((conduit::utils::available_parallelism() as f64 * 2.0) + 1.0)) as u32;
+			/ (conduit::utils::available_parallelism() as f64).mul_add(2.0, 1.0)) as u32;
 
 		let writer = Mutex::new(Engine::prepare_conn(&path, cache_size_per_thread)?);
 
-		let arc = Arc::new(Engine {
+		let arc = Self::new(Engine {
 			writer,
 			read_conn_tls: ThreadLocal::new(),
 			read_iterator_conn_tls: ThreadLocal::new(),
@@ -131,7 +131,7 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
 		)?;
 
 		Ok(Arc::new(SqliteTable {
-			engine: Arc::clone(self),
+			engine: Self::clone(self),
 			name: name.to_owned(),
 			watchers: Watchers::default(),
 		}))
