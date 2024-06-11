@@ -14,7 +14,7 @@ pub(crate) async fn enable_room(_body: Vec<&str>, room_id: Box<RoomId>) -> Resul
 	Ok(RoomMessageEventContent::text_plain("Room enabled."))
 }
 
-pub(crate) async fn incoming_federeation(_body: Vec<&str>) -> Result<RoomMessageEventContent> {
+pub(crate) async fn incoming_federation(_body: Vec<&str>) -> Result<RoomMessageEventContent> {
 	let map = services().globals.roomid_federationhandletime.read().await;
 	let mut msg = format!("Handling {} incoming pdus:\n", map.len());
 
@@ -101,7 +101,8 @@ pub(crate) async fn remote_user_in_rooms(_body: Vec<&str>, user_id: Box<UserId>)
 	rooms.reverse();
 
 	let output_plain = format!(
-		"Rooms {user_id} shares with us:\n{}",
+		"Rooms {user_id} shares with us ({}):\n{}",
+		rooms.len(),
 		rooms
 			.iter()
 			.map(|(id, members, name)| format!("{id}\tMembers: {members}\tName: {name}"))
@@ -109,15 +110,16 @@ pub(crate) async fn remote_user_in_rooms(_body: Vec<&str>, user_id: Box<UserId>)
 			.join("\n")
 	);
 	let output_html = format!(
-		"<table><caption>Rooms {user_id} shares with \
-		 us</caption>\n<tr><th>id</th>\t<th>members</th>\t<th>name</th></tr>\n{}</table>",
+		"<table><caption>Rooms {user_id} shares with us \
+		 ({})</caption>\n<tr><th>id</th>\t<th>members</th>\t<th>name</th></tr>\n{}</table>",
+		rooms.len(),
 		rooms
 			.iter()
 			.fold(String::new(), |mut output, (id, members, name)| {
 				writeln!(
 					output,
 					"<tr><td>{}</td>\t<td>{}</td>\t<td>{}</td></tr>",
-					escape_html(id.as_ref()),
+					id,
 					members,
 					escape_html(name)
 				)

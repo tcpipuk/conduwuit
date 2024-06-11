@@ -1,9 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+	collections::{BTreeMap, HashMap},
+	sync::Arc,
+	time::Instant,
+};
 
+use api::client::validate_and_add_event_id;
 use conduit::{utils::HtmlEscape, Error, Result};
 use ruma::{
-	api::client::error::ErrorKind, events::room::message::RoomMessageEventContent, CanonicalJsonObject, EventId,
-	RoomId, RoomVersionId, ServerName,
+	api::{client::error::ErrorKind, federation::event::get_room_state},
+	events::room::message::RoomMessageEventContent,
+	CanonicalJsonObject, EventId, RoomId, RoomVersionId, ServerName,
 };
 use service::{rooms::event_handler::parse_incoming_pdu, sending::resolve::resolve_actual_dest, services, PduEvent};
 use tokio::sync::RwLock;
@@ -37,28 +43,30 @@ pub(crate) async fn get_auth_chain(_body: Vec<&str>, event_id: Box<EventId>) -> 
 }
 
 pub(crate) async fn parse_pdu(body: Vec<&str>) -> Result<RoomMessageEventContent> {
-	if body.len() > 2 && body[0].trim().starts_with("```") && body.last().unwrap().trim() == "```" {
-		let string = body[1..body.len() - 1].join("\n");
-		match serde_json::from_str(&string) {
-			Ok(value) => match ruma::signatures::reference_hash(&value, &RoomVersionId::V6) {
-				Ok(hash) => {
-					let event_id = EventId::parse(format!("${hash}"));
+	if body.len() < 2 || !body[0].trim().starts_with("```") || body.last().unwrap_or(&"").trim() != "```" {
+		return Ok(RoomMessageEventContent::text_plain(
+			"Expected code block in command body. Add --help for details.",
+		));
+	}
 
-					match serde_json::from_value::<PduEvent>(serde_json::to_value(value).expect("value is json")) {
-						Ok(pdu) => Ok(RoomMessageEventContent::text_plain(format!("EventId: {event_id:?}\n{pdu:#?}"))),
-						Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
-							"EventId: {event_id:?}\nCould not parse event: {e}"
-						))),
-					}
-				},
-				Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Could not parse PDU JSON: {e:?}"))),
+	let string = body[1..body.len() - 1].join("\n");
+	match serde_json::from_str(&string) {
+		Ok(value) => match ruma::signatures::reference_hash(&value, &RoomVersionId::V6) {
+			Ok(hash) => {
+				let event_id = EventId::parse(format!("${hash}"));
+
+				match serde_json::from_value::<PduEvent>(serde_json::to_value(value).expect("value is json")) {
+					Ok(pdu) => Ok(RoomMessageEventContent::text_plain(format!("EventId: {event_id:?}\n{pdu:#?}"))),
+					Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
+						"EventId: {event_id:?}\nCould not parse event: {e}"
+					))),
+				}
 			},
-			Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
-				"Invalid json in command body: {e}"
-			))),
-		}
-	} else {
-		Ok(RoomMessageEventContent::text_plain("Expected code block in command body."))
+			Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Could not parse PDU JSON: {e:?}"))),
+		},
+		Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
+			"Invalid json in command body: {e}"
+		))),
 	}
 }
 
@@ -111,33 +119,40 @@ pub(crate) async fn get_remote_pdu_list(
 
 	if server == services().globals.server_name() {
 		return Ok(RoomMessageEventContent::text_plain(
-			"Not allowed to send federation requests to ourselves. Please use `get-pdu` for fetching local PDUs.",
+			"Not allowed to send federation requests to ourselves. Please use `get-pdu` for fetching local PDUs from \
+			 the database.",
 		));
 	}
 
-	if body.len() > 2 && body[0].trim().starts_with("```") && body.last().unwrap().trim() == "```" {
-		let list = body
-			.clone()
-			.drain(1..body.len().checked_sub(1).unwrap())
-			.filter_map(|pdu| EventId::parse(pdu).ok())
-			.collect::<Vec<_>>();
-
-		for pdu in list {
-			if force {
-				if let Err(e) = get_remote_pdu(Vec::new(), Box::from(pdu), server.clone()).await {
-					warn!(%e, "Failed to get remote PDU, ignoring error");
-				}
-			} else {
-				get_remote_pdu(Vec::new(), Box::from(pdu), server.clone()).await?;
-			}
-		}
-
-		return Ok(RoomMessageEventContent::text_plain("Fetched list of remote PDUs."));
+	if body.len() < 2 || !body[0].trim().starts_with("```") || body.last().unwrap_or(&"").trim() != "```" {
+		return Ok(RoomMessageEventContent::text_plain(
+			"Expected code block in command body. Add --help for details.",
+		));
 	}
 
-	Ok(RoomMessageEventContent::text_plain(
-		"Expected code block in command body. Add --help for details.",
-	))
+	let list = body
+		.clone()
+		.drain(1..body.len().checked_sub(1).unwrap())
+		.filter_map(|pdu| EventId::parse(pdu).ok())
+		.collect::<Vec<_>>();
+
+	for pdu in list {
+		if force {
+			if let Err(e) = get_remote_pdu(Vec::new(), Box::from(pdu), server.clone()).await {
+				services()
+					.admin
+					.send_message(RoomMessageEventContent::text_plain(format!(
+						"Failed to get remote PDU, ignoring error: {e}"
+					)))
+					.await;
+				warn!(%e, "Failed to get remote PDU, ignoring error");
+			}
+		} else {
+			get_remote_pdu(Vec::new(), Box::from(pdu), server.clone()).await?;
+		}
+	}
+
+	Ok(RoomMessageEventContent::text_plain("Fetched list of remote PDUs."))
 }
 
 pub(crate) async fn get_remote_pdu(
@@ -378,55 +393,55 @@ pub(crate) async fn change_log_level(
 }
 
 pub(crate) async fn sign_json(body: Vec<&str>) -> Result<RoomMessageEventContent> {
-	if body.len() > 2 && body[0].trim().starts_with("```") && body.last().unwrap().trim() == "```" {
-		let string = body[1..body.len().checked_sub(1).unwrap()].join("\n");
-		match serde_json::from_str(&string) {
-			Ok(mut value) => {
-				ruma::signatures::sign_json(
-					services().globals.server_name().as_str(),
-					services().globals.keypair(),
-					&mut value,
-				)
-				.expect("our request json is what ruma expects");
-				let json_text = serde_json::to_string_pretty(&value).expect("canonical json is valid json");
-				Ok(RoomMessageEventContent::text_plain(json_text))
-			},
-			Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Invalid json: {e}"))),
-		}
-	} else {
-		Ok(RoomMessageEventContent::text_plain(
+	if body.len() < 2 || !body[0].trim().starts_with("```") || body.last().unwrap_or(&"").trim() != "```" {
+		return Ok(RoomMessageEventContent::text_plain(
 			"Expected code block in command body. Add --help for details.",
-		))
+		));
+	}
+
+	let string = body[1..body.len().checked_sub(1).unwrap()].join("\n");
+	match serde_json::from_str(&string) {
+		Ok(mut value) => {
+			ruma::signatures::sign_json(
+				services().globals.server_name().as_str(),
+				services().globals.keypair(),
+				&mut value,
+			)
+			.expect("our request json is what ruma expects");
+			let json_text = serde_json::to_string_pretty(&value).expect("canonical json is valid json");
+			Ok(RoomMessageEventContent::text_plain(json_text))
+		},
+		Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Invalid json: {e}"))),
 	}
 }
 
 pub(crate) async fn verify_json(body: Vec<&str>) -> Result<RoomMessageEventContent> {
-	if body.len() > 2 && body[0].trim().starts_with("```") && body.last().unwrap().trim() == "```" {
-		let string = body[1..body.len().checked_sub(1).unwrap()].join("\n");
-		match serde_json::from_str(&string) {
-			Ok(value) => {
-				let pub_key_map = RwLock::new(BTreeMap::new());
-
-				services()
-					.rooms
-					.event_handler
-					.fetch_required_signing_keys([&value], &pub_key_map)
-					.await?;
-
-				let pub_key_map = pub_key_map.read().await;
-				match ruma::signatures::verify_json(&pub_key_map, &value) {
-					Ok(()) => Ok(RoomMessageEventContent::text_plain("Signature correct")),
-					Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
-						"Signature verification failed: {e}"
-					))),
-				}
-			},
-			Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Invalid json: {e}"))),
-		}
-	} else {
-		Ok(RoomMessageEventContent::text_plain(
+	if body.len() < 2 || !body[0].trim().starts_with("```") || body.last().unwrap_or(&"").trim() != "```" {
+		return Ok(RoomMessageEventContent::text_plain(
 			"Expected code block in command body. Add --help for details.",
-		))
+		));
+	}
+
+	let string = body[1..body.len().checked_sub(1).unwrap()].join("\n");
+	match serde_json::from_str(&string) {
+		Ok(value) => {
+			let pub_key_map = RwLock::new(BTreeMap::new());
+
+			services()
+				.rooms
+				.event_handler
+				.fetch_required_signing_keys([&value], &pub_key_map)
+				.await?;
+
+			let pub_key_map = pub_key_map.read().await;
+			match ruma::signatures::verify_json(&pub_key_map, &value) {
+				Ok(()) => Ok(RoomMessageEventContent::text_plain("Signature correct")),
+				Err(e) => Ok(RoomMessageEventContent::text_plain(format!(
+					"Signature verification failed: {e}"
+				))),
+			}
+		},
+		Err(e) => Ok(RoomMessageEventContent::text_plain(format!("Invalid json: {e}"))),
 	}
 }
 
@@ -470,6 +485,147 @@ pub(crate) async fn latest_pdu_in_room(_body: Vec<&str>, room_id: Box<RoomId>) -
 		.ok_or_else(|| Error::bad_database("Failed to find the latest PDU in database"))?;
 
 	Ok(RoomMessageEventContent::text_plain(format!("{latest_pdu:?}")))
+}
+
+#[tracing::instrument(skip(_body))]
+pub(crate) async fn force_set_room_state_from_server(
+	_body: Vec<&str>, server_name: Box<ServerName>, room_id: Box<RoomId>,
+) -> Result<RoomMessageEventContent> {
+	if !services()
+		.rooms
+		.state_cache
+		.server_in_room(&services().globals.config.server_name, &room_id)?
+	{
+		return Ok(RoomMessageEventContent::text_plain(
+			"We are not participating in the room / we don't know about the room ID.",
+		));
+	}
+
+	let first_pdu = services()
+		.rooms
+		.timeline
+		.latest_pdu_in_room(&room_id)?
+		.ok_or_else(|| Error::bad_database("Failed to find the latest PDU in database"))?;
+
+	let room_version = services().rooms.state.get_room_version(&room_id)?;
+
+	let mut state: HashMap<u64, Arc<EventId>> = HashMap::new();
+	let pub_key_map = RwLock::new(BTreeMap::new());
+
+	let remote_state_response = services()
+		.sending
+		.send_federation_request(
+			&server_name,
+			get_room_state::v1::Request {
+				room_id: room_id.clone().into(),
+				event_id: first_pdu.event_id.clone().into(),
+			},
+		)
+		.await?;
+
+	let mut events = Vec::with_capacity(remote_state_response.pdus.len());
+
+	for pdu in remote_state_response.pdus.clone() {
+		events.push(match parse_incoming_pdu(&pdu) {
+			Ok(t) => t,
+			Err(e) => {
+				warn!("Could not parse PDU, ignoring: {e}");
+				continue;
+			},
+		});
+	}
+
+	info!("Fetching required signing keys for all the state events we got");
+	services()
+		.rooms
+		.event_handler
+		.fetch_required_signing_keys(events.iter().map(|(_event_id, event, _room_id)| event), &pub_key_map)
+		.await?;
+
+	info!("Going through room_state response PDUs");
+	for result in remote_state_response
+		.pdus
+		.iter()
+		.map(|pdu| validate_and_add_event_id(pdu, &room_version, &pub_key_map))
+	{
+		let Ok((event_id, value)) = result.await else {
+			continue;
+		};
+
+		let pdu = PduEvent::from_id_val(&event_id, value.clone()).map_err(|e| {
+			warn!("Invalid PDU in fetching remote room state PDUs response: {} {:?}", e, value);
+			Error::BadServerResponse("Invalid PDU in send_join response.")
+		})?;
+
+		services()
+			.rooms
+			.outlier
+			.add_pdu_outlier(&event_id, &value)?;
+		if let Some(state_key) = &pdu.state_key {
+			let shortstatekey = services()
+				.rooms
+				.short
+				.get_or_create_shortstatekey(&pdu.kind.to_string().into(), state_key)?;
+			state.insert(shortstatekey, pdu.event_id.clone());
+		}
+	}
+
+	info!("Going through auth_chain response");
+	for result in remote_state_response
+		.auth_chain
+		.iter()
+		.map(|pdu| validate_and_add_event_id(pdu, &room_version, &pub_key_map))
+	{
+		let Ok((event_id, value)) = result.await else {
+			continue;
+		};
+
+		services()
+			.rooms
+			.outlier
+			.add_pdu_outlier(&event_id, &value)?;
+	}
+
+	let new_room_state = services()
+		.rooms
+		.event_handler
+		.resolve_state(room_id.clone().as_ref(), &room_version, state)
+		.await?;
+
+	info!("Forcing new room state");
+	let (short_state_hash, new, removed) = services()
+		.rooms
+		.state_compressor
+		.save_state(room_id.clone().as_ref(), new_room_state)?;
+
+	let mutex_state = Arc::clone(
+		services()
+			.globals
+			.roomid_mutex_state
+			.write()
+			.await
+			.entry(room_id.clone().into())
+			.or_default(),
+	);
+	let state_lock = mutex_state.lock().await;
+
+	services()
+		.rooms
+		.state
+		.force_state(room_id.clone().as_ref(), short_state_hash, new, removed, &state_lock)
+		.await?;
+
+	info!(
+		"Updating joined counts for room just in case (e.g. we may have found a difference in the room's \
+		 m.room.member state"
+	);
+	services().rooms.state_cache.update_joined_count(&room_id)?;
+
+	drop(state_lock);
+
+	Ok(RoomMessageEventContent::text_plain(
+		"Successfully forced the room state from the requested remote server.",
+	))
 }
 
 pub(crate) async fn resolve_true_destination(

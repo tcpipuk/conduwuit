@@ -15,11 +15,8 @@ use ruma::{
 	events::{
 		room::{
 			avatar::RoomAvatarEventContent,
-			canonical_alias::RoomCanonicalAliasEventContent,
 			create::RoomCreateEventContent,
-			guest_access::{GuestAccess, RoomGuestAccessEventContent},
 			join_rules::{AllowRule, JoinRule, RoomJoinRulesEventContent, RoomMembership},
-			topic::RoomTopicEventContent,
 		},
 		space::child::{HierarchySpaceChildEvent, SpaceChildEventContent},
 		StateEventType,
@@ -559,12 +556,7 @@ impl Service {
 			canonical_alias: services()
 				.rooms
 				.state_accessor
-				.room_state_get(room_id, &StateEventType::RoomCanonicalAlias, "")?
-				.map_or(Ok(None), |s| {
-					serde_json::from_str(s.content.get())
-						.map(|c: RoomCanonicalAliasEventContent| c.alias)
-						.map_err(|_| Error::bad_database("Invalid canonical alias event in database."))
-				})?,
+				.get_canonical_alias(room_id)?,
 			name: services().rooms.state_accessor.get_name(room_id)?,
 			num_joined_members: services()
 				.rooms
@@ -580,18 +572,10 @@ impl Service {
 			topic: services()
 				.rooms
 				.state_accessor
-				.room_state_get(room_id, &StateEventType::RoomTopic, "")?
-				.map_or(Ok(None), |s| {
-					serde_json::from_str(s.content.get())
-						.map(|c: RoomTopicEventContent| Some(c.topic))
-						.map_err(|_| {
-							error!("Invalid room topic event in database for room {}", room_id);
-							Error::bad_database("Invalid room topic event in database.")
-						})
-				})
+				.get_room_topic(room_id)
 				.unwrap_or(None),
 			world_readable: services().rooms.state_accessor.is_world_readable(room_id)?,
-			guest_can_join: guest_can_join(room_id)?,
+			guest_can_join: services().rooms.state_accessor.guest_can_join(room_id)?,
 			avatar_url: services()
                 .rooms
                 .state_accessor
@@ -845,19 +829,6 @@ fn is_accessable_child_recurse(
 		// If you need to go up 10 parents, we just assume it is inaccessable
 		Ok(false)
 	}
-}
-
-/// Checks if guests are able to join a given room
-fn guest_can_join(room_id: &RoomId) -> Result<bool, Error> {
-	services()
-		.rooms
-		.state_accessor
-		.room_state_get(room_id, &StateEventType::RoomGuestAccess, "")?
-		.map_or(Ok(false), |s| {
-			serde_json::from_str(s.content.get())
-				.map(|c: RoomGuestAccessEventContent| c.guest_access == GuestAccess::CanJoin)
-				.map_err(|_| Error::bad_database("Invalid room guest access event in database."))
-		})
 }
 
 /// Returns the join rule for a given room
