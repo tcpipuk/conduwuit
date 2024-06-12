@@ -133,6 +133,7 @@ pub(crate) async fn search_events_route(body: Ruma<search_events::v3::Request>) 
 
 	let results: Vec<_> = results
 		.iter()
+		.skip(skip)
 		.filter_map(|result| {
 			services()
 				.rooms
@@ -140,11 +141,12 @@ pub(crate) async fn search_events_route(body: Ruma<search_events::v3::Request>) 
 				.get_pdu_from_id(result)
 				.ok()?
 				.filter(|pdu| {
-					services()
-						.rooms
-						.state_accessor
-						.user_can_see_event(sender_user, &pdu.room_id, &pdu.event_id)
-						.unwrap_or(false)
+					!pdu.is_redacted()
+						&& services()
+							.rooms
+							.state_accessor
+							.user_can_see_event(sender_user, &pdu.room_id, &pdu.event_id)
+							.unwrap_or(false)
 				})
 				.map(|pdu| pdu.to_room_event())
 		})
@@ -162,15 +164,11 @@ pub(crate) async fn search_events_route(body: Ruma<search_events::v3::Request>) 
 			})
 		})
 		.filter_map(Result::ok)
-		.skip(skip)
 		.take(limit)
 		.collect();
 
-	let next_batch = if results.len() < limit {
-		None
-	} else {
-		Some(next_batch.to_string())
-	};
+	let more_unloaded_results = searches.iter_mut().any(|s| s.peek().is_some());
+	let next_batch = more_unloaded_results.then(|| next_batch.to_string());
 
 	Ok(search_events::v3::Response::new(ResultCategories {
 		room_events: ResultRoomEvents {

@@ -68,6 +68,11 @@ struct ExtractRelatesToEventId {
 	relates_to: ExtractEventId,
 }
 
+#[derive(Deserialize)]
+struct ExtractBody {
+	body: Option<String>,
+}
+
 pub struct Service {
 	pub db: Arc<dyn Data>,
 
@@ -397,7 +402,7 @@ impl Service {
 					| RoomVersionId::V9
 					| RoomVersionId::V10 => {
 						if let Some(redact_id) = &pdu.redacts {
-							self.redact_pdu(redact_id, pdu)?;
+							self.redact_pdu(redact_id, pdu, shortroomid)?;
 						}
 					},
 					RoomVersionId::V11 => {
@@ -407,7 +412,7 @@ impl Service {
 								Error::bad_database("Invalid content in redaction pdu.")
 							})?;
 						if let Some(redact_id) = &content.redacts {
-							self.redact_pdu(redact_id, pdu)?;
+							self.redact_pdu(redact_id, pdu, shortroomid)?;
 						}
 					},
 					_ => {
@@ -463,11 +468,6 @@ impl Service {
 				}
 			},
 			TimelineEventType::RoomMessage => {
-				#[derive(Deserialize)]
-				struct ExtractBody {
-					body: Option<String>,
-				}
-
 				let content = serde_json::from_str::<ExtractBody>(pdu.content.get())
 					.map_err(|_| Error::bad_database("Invalid content in pdu."))?;
 
@@ -477,19 +477,25 @@ impl Service {
 						.search
 						.index_pdu(shortroomid, &pdu_id, &body)?;
 
-					let server_user = format!("@conduit:{}", services().globals.server_name());
+					let server_user = &services().globals.server_user;
 
 					let to_conduit = body.starts_with(&format!("{server_user}: "))
 						|| body.starts_with(&format!("{server_user} "))
 						|| body.starts_with("!admin")
 						|| body == format!("{server_user}:")
-						|| body == server_user;
+						|| body == *server_user;
 
 					// This will evaluate to false if the emergency password is set up so that
 					// the administrator can execute commands as conduit
-					let from_conduit = pdu.sender == server_user && services().globals.emergency_password().is_none();
-					if let Some(admin_room) = service::admin::Service::get_admin_room().await? {
-						if to_conduit && !from_conduit && admin_room == pdu.room_id {
+					let from_conduit = pdu.sender == *server_user && services().globals.emergency_password().is_none();
+					if let Some(admin_room) = service::admin::Service::get_admin_room()? {
+						if to_conduit
+							&& !from_conduit && admin_room == pdu.room_id
+							&& services()
+								.rooms
+								.state_cache
+								.is_joined(server_user, &admin_room)?
+						{
 							services()
 								.admin
 								.process_message(body, pdu.event_id.clone())
@@ -789,7 +795,7 @@ impl Service {
 		state_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<Arc<EventId>> {
 		let (pdu, pdu_json) = self.create_hash_and_sign_event(pdu_builder, sender, room_id, state_lock)?;
-		if let Some(admin_room) = service::admin::Service::get_admin_room().await? {
+		if let Some(admin_room) = service::admin::Service::get_admin_room()? {
 			if admin_room == room_id {
 				match pdu.event_type() {
 					TimelineEventType::RoomEncryption => {
@@ -804,8 +810,8 @@ impl Service {
 							.state_key()
 							.filter(|v| v.starts_with('@'))
 							.unwrap_or(sender.as_str());
-						let server_name = services().globals.server_name();
-						let server_user = format!("@conduit:{server_name}");
+						let server_user = &services().globals.server_user.to_string();
+
 						let content = serde_json::from_str::<RoomMemberEventContent>(pdu.content.get())
 							.map_err(|_| Error::bad_database("Invalid content in pdu."))?;
 
@@ -984,14 +990,26 @@ impl Service {
 
 	/// Replace a PDU with the redacted form.
 	#[tracing::instrument(skip(self, reason))]
-	pub fn redact_pdu(&self, event_id: &EventId, reason: &PduEvent) -> Result<()> {
+	pub fn redact_pdu(&self, event_id: &EventId, reason: &PduEvent, shortroomid: u64) -> Result<()> {
 		// TODO: Don't reserialize, keep original json
 		if let Some(pdu_id) = self.get_pdu_id(event_id)? {
 			let mut pdu = self
 				.get_pdu_from_id(&pdu_id)?
 				.ok_or_else(|| Error::bad_database("PDU ID points to invalid PDU."))?;
+
+			if let Ok(content) = serde_json::from_str::<ExtractBody>(pdu.content.get()) {
+				if let Some(body) = content.body {
+					services()
+						.rooms
+						.search
+						.deindex_pdu(shortroomid, &pdu_id, &body)?;
+				}
+			}
+
 			let room_version_id = services().rooms.state.get_room_version(&pdu.room_id)?;
+
 			pdu.redact(room_version_id, reason)?;
+
 			self.replace_pdu(
 				&pdu_id,
 				&utils::to_canonical_object(&pdu).map_err(|e| {
@@ -1188,11 +1206,6 @@ impl Service {
 		drop(insert_lock);
 
 		if pdu.kind == TimelineEventType::RoomMessage {
-			#[derive(Deserialize)]
-			struct ExtractBody {
-				body: Option<String>,
-			}
-
 			let content = serde_json::from_str::<ExtractBody>(pdu.content.get())
 				.map_err(|_| Error::bad_database("Invalid content in pdu."))?;
 
