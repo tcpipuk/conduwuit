@@ -30,21 +30,21 @@ use ruma::{
 };
 use serde::Deserialize;
 use serde_json::value::{to_raw_value, RawValue as RawJsonValue};
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use super::state_compressor::CompressedStateEvent;
 use crate::{
+	admin,
 	server_is_ours,
 	//api::server_server,
 	service::{
-		self,
 		appservice::NamespaceRegex,
 		pdu::{EventHash, PduBuilder},
 		rooms::event_handler::parse_incoming_pdu,
 	},
 	services,
-	utils::{self},
+	utils::{self, mutex_map},
 	Error,
 	PduCount,
 	PduEvent,
@@ -200,13 +200,13 @@ impl Service {
 	/// happens in `append_pdu`.
 	///
 	/// Returns pdu id
-	#[tracing::instrument(skip(self, pdu, pdu_json, leaves))]
+	#[tracing::instrument(skip_all)]
 	pub async fn append_pdu(
 		&self,
 		pdu: &PduEvent,
 		mut pdu_json: CanonicalJsonObject,
 		leaves: Vec<OwnedEventId>,
-		state_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
+		state_lock: &mutex_map::Guard<()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<Vec<u8>> {
 		// Coalesce database writes for the remainder of this scope.
 		let _cork = services().globals.db.cork_and_flush();
@@ -271,16 +271,11 @@ impl Service {
 			.state
 			.set_forward_extremities(&pdu.room_id, leaves, state_lock)?;
 
-		let mutex_insert = Arc::clone(
-			services()
-				.globals
-				.roomid_mutex_insert
-				.write()
-				.await
-				.entry(pdu.room_id.clone())
-				.or_default(),
-		);
-		let insert_lock = mutex_insert.lock().await;
+		let insert_lock = services()
+			.globals
+			.roomid_mutex_insert
+			.lock(&pdu.room_id)
+			.await;
 
 		let count1 = services().globals.next_count()?;
 		// Mark as read first so the sending client doesn't get a notification even if
@@ -477,30 +472,11 @@ impl Service {
 						.search
 						.index_pdu(shortroomid, &pdu_id, &body)?;
 
-					let server_user = &services().globals.server_user;
-
-					let to_conduit = body.starts_with(&format!("{server_user}: "))
-						|| body.starts_with(&format!("{server_user} "))
-						|| body.starts_with("!admin")
-						|| body == format!("{server_user}:")
-						|| body == *server_user;
-
-					// This will evaluate to false if the emergency password is set up so that
-					// the administrator can execute commands as conduit
-					let from_conduit = pdu.sender == *server_user && services().globals.emergency_password().is_none();
-					if let Some(admin_room) = service::admin::Service::get_admin_room()? {
-						if to_conduit
-							&& !from_conduit && admin_room == pdu.room_id
-							&& services()
-								.rooms
-								.state_cache
-								.is_joined(server_user, &admin_room)?
-						{
-							services()
-								.admin
-								.process_message(body, pdu.event_id.clone())
-								.await;
-						}
+					if admin::is_admin_command(pdu, &body).await {
+						services()
+							.admin
+							.command(body, Some(pdu.event_id.clone()))
+							.await;
 					}
 				}
 			},
@@ -605,7 +581,7 @@ impl Service {
 		pdu_builder: PduBuilder,
 		sender: &UserId,
 		room_id: &RoomId,
-		_mutex_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
+		_mutex_lock: &mutex_map::Guard<()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<(PduEvent, CanonicalJsonObject)> {
 		let PduBuilder {
 			event_type,
@@ -792,10 +768,10 @@ impl Service {
 		pdu_builder: PduBuilder,
 		sender: &UserId,
 		room_id: &RoomId,
-		state_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
+		state_lock: &mutex_map::Guard<()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<Arc<EventId>> {
 		let (pdu, pdu_json) = self.create_hash_and_sign_event(pdu_builder, sender, room_id, state_lock)?;
-		if let Some(admin_room) = service::admin::Service::get_admin_room()? {
+		if let Some(admin_room) = admin::Service::get_admin_room()? {
 			if admin_room == room_id {
 				match pdu.event_type() {
 					TimelineEventType::RoomEncryption => {
@@ -933,7 +909,7 @@ impl Service {
 		new_room_leaves: Vec<OwnedEventId>,
 		state_ids_compressed: Arc<HashSet<CompressedStateEvent>>,
 		soft_fail: bool,
-		state_lock: &MutexGuard<'_, ()>, // Take mutex guard to make sure users get the room state mutex
+		state_lock: &mutex_map::Guard<()>, // Take mutex guard to make sure users get the room state mutex
 	) -> Result<Option<Vec<u8>>> {
 		// We append to state before appending the pdu, so we don't have a moment in
 		// time with the pdu without it's state. This is okay because append_pdu can't
@@ -1146,16 +1122,11 @@ impl Service {
 		let (event_id, value, room_id) = parse_incoming_pdu(&pdu)?;
 
 		// Lock so we cannot backfill the same pdu twice at the same time
-		let mutex = Arc::clone(
-			services()
-				.globals
-				.roomid_mutex_federation
-				.write()
-				.await
-				.entry(room_id.clone())
-				.or_default(),
-		);
-		let mutex_lock = mutex.lock().await;
+		let mutex_lock = services()
+			.globals
+			.roomid_mutex_federation
+			.lock(&room_id)
+			.await;
 
 		// Skip the PDU if we already have it as a timeline event
 		if let Some(pdu_id) = self.get_pdu_id(&event_id)? {
@@ -1184,16 +1155,7 @@ impl Service {
 			.get_shortroomid(&room_id)?
 			.expect("room exists");
 
-		let mutex_insert = Arc::clone(
-			services()
-				.globals
-				.roomid_mutex_insert
-				.write()
-				.await
-				.entry(room_id.clone())
-				.or_default(),
-		);
-		let insert_lock = mutex_insert.lock().await;
+		let insert_lock = services().globals.roomid_mutex_insert.lock(&room_id).await;
 
 		let count = services().globals.next_count()?;
 		let mut pdu_id = shortroomid.to_be_bytes().to_vec();
@@ -1222,6 +1184,7 @@ impl Service {
 		Ok(())
 	}
 }
+
 #[cfg(test)]
 mod tests {
 	use super::*;

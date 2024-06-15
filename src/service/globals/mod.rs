@@ -14,6 +14,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
+use conduit::utils;
 use data::Data;
 use hickory_resolver::TokioAsyncResolver;
 use ipaddress::IPAddress;
@@ -33,6 +34,7 @@ use tokio::{
 };
 use tracing::{error, trace};
 use url::Url;
+use utils::MutexMap;
 
 use crate::{services, Config, Result};
 
@@ -52,9 +54,9 @@ pub struct Service {
 	pub bad_event_ratelimiter: Arc<RwLock<HashMap<OwnedEventId, RateLimitState>>>,
 	pub bad_signature_ratelimiter: Arc<RwLock<HashMap<Vec<String>, RateLimitState>>>,
 	pub bad_query_ratelimiter: Arc<RwLock<HashMap<OwnedServerName, RateLimitState>>>,
-	pub roomid_mutex_insert: RwLock<HashMap<OwnedRoomId, Arc<Mutex<()>>>>,
-	pub roomid_mutex_state: RwLock<HashMap<OwnedRoomId, Arc<Mutex<()>>>>,
-	pub roomid_mutex_federation: RwLock<HashMap<OwnedRoomId, Arc<Mutex<()>>>>, // this lock will be held longer
+	pub roomid_mutex_insert: MutexMap<OwnedRoomId, ()>,
+	pub roomid_mutex_state: MutexMap<OwnedRoomId, ()>,
+	pub roomid_mutex_federation: MutexMap<OwnedRoomId, ()>,
 	pub roomid_federationhandletime: RwLock<HashMap<OwnedRoomId, (OwnedEventId, Instant)>>,
 	pub updates_handle: Mutex<Option<JoinHandle<()>>>,
 	pub stateres_mutex: Arc<Mutex<()>>,
@@ -114,9 +116,9 @@ impl Service {
 			bad_event_ratelimiter: Arc::new(RwLock::new(HashMap::new())),
 			bad_signature_ratelimiter: Arc::new(RwLock::new(HashMap::new())),
 			bad_query_ratelimiter: Arc::new(RwLock::new(HashMap::new())),
-			roomid_mutex_state: RwLock::new(HashMap::new()),
-			roomid_mutex_insert: RwLock::new(HashMap::new()),
-			roomid_mutex_federation: RwLock::new(HashMap::new()),
+			roomid_mutex_state: MutexMap::<OwnedRoomId, ()>::new(),
+			roomid_mutex_insert: MutexMap::<OwnedRoomId, ()>::new(),
+			roomid_mutex_federation: MutexMap::<OwnedRoomId, ()>::new(),
 			roomid_federationhandletime: RwLock::new(HashMap::new()),
 			updates_handle: Mutex::new(None),
 			stateres_mutex: Arc::new(Mutex::new(())),
